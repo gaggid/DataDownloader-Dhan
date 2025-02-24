@@ -5,7 +5,7 @@
     and perform various trading operations through the DhanHQ API.
 
     :copyright: (c) 2024 by Dhan.
-    :license: see LICENSE for details.
+    :license: see LICENSE for details...
 """
 
 

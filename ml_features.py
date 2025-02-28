@@ -10,10 +10,16 @@ class FeatureEngineering:
         self.db_config = db_config
 
     def connect_to_db(self):
-        return mysql.connector.connect(**self.db_config)
+        """Create a new database connection."""
+        try:
+            return mysql.connector.connect(**self.db_config)
+        except Exception as e:
+            print(f"Error connecting to database: {e}")
+            return None  # Or raise the exception, depending on your error handling strategy
 
     def fetch_data(self, trading_symbols, start_date, end_date):
         """Fetches historical and technical indicator data for given symbols and date range."""
+        conn = None  # Initialize conn to None
         try:
             conn = self.connect_to_db()
             cursor = conn.cursor(dictionary=True)
@@ -56,16 +62,18 @@ class FeatureEngineering:
             cursor.execute(query, params)
             data = cursor.fetchall()
 
+            cursor.close()  # Close the cursor
             conn.close()
+
             return pd.DataFrame(data)
 
         except Exception as e:
             print(f"Error fetching data: {e}")
-            if 'conn' in locals():
+            if conn:  # Check if conn is not None before closing
                 conn.close()
             return pd.DataFrame()
 
-    def create_features(self, df, prediction_horizon=5, lag_days=[1, 2, 3, 5, 10], threshold=0.01):  # prediction_horizon = 5
+    def create_features(self, df, prediction_horizon=5, lag_days=[1, 2, 3, 5, 10], threshold=0.01):
         """Creates features and target variable for machine learning."""
 
         if df.empty:
@@ -74,7 +82,7 @@ class FeatureEngineering:
 
         print(f"Initial DataFrame length: {len(df)}")  # Debugging
 
-        # Convert close, volume, high, and low to float before creating lag features
+        # Convert close, volume, high, low, and open to float before creating lag features
         df['close'] = df['close'].astype(float)
         df['volume'] = df['volume'].astype(float)
         df['high'] = df['high'].astype(float)
@@ -149,39 +157,32 @@ class FeatureEngineering:
             return symbols
 
         except Exception as e:
-            print(f"Error fetching trading symbols: {e}")
+            print(f"Error fetching trading symbols: {str(e)}")
             if 'conn' in locals():
                 conn.close()
             return []
 
     def store_features(self, df, table_name='ml_features', batch_size=10000):
-        """Stores the generated features in a MySQL table using batch insertion, appending only new data."""
+        """Stores the generated features in a MySQL table."""
         try:
+            print("Entering store_features function")  # Debugging
             conn = self.connect_to_db()
             cursor = conn.cursor()
 
-            # 1. Create the table if it doesn't exist
-            # (Adjust data types as needed)
-            columns = ", ".join([f"{col} FLOAT" for col in df.columns if col not in ('date', 'trading_symbol')])
-            create_table_query = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
-                    date DATE,
-                    trading_symbol VARCHAR(255),
-                    {columns},
-                    PRIMARY KEY (date, trading_symbol)
-                )
-            """
-            cursor.execute(create_table_query)
+            # Print data types before storing
+            print("Data types before storing:")  # Debugging
+            print(df.dtypes)  # Debugging
 
-            # 2. Fetch existing data from ml_features table
-            existing_data_query = f"""
-                SELECT date, trading_symbol
-                FROM {table_name}
-            """
-            cursor.execute(existing_data_query)
-            existing_data = set((row[0], row[1]) for row in cursor.fetchall())
+            # Convert all numeric columns to float
+            numeric_cols = df.select_dtypes(include=np.number).columns
+            df[numeric_cols] = df[numeric_cols].astype(float)
 
-            # 3. Prepare the INSERT query
+            # Print data types after conversion
+            print("Data types after conversion:")  # Debugging
+            print(df.dtypes)  # Debugging
+
+            # 1. Prepare the INSERT query
+            print("Preparing INSERT query...")  # Debugging
             columns = ", ".join(df.columns)
             placeholders = ", ".join(["%s"] * len(df.columns))
             insert_query = f"""
@@ -189,33 +190,31 @@ class FeatureEngineering:
                 VALUES ({placeholders})
             """
 
-            # 4. Iterate over the DataFrame in batches and filter out existing data
+            # 2. Execute the INSERT query for the data in batches
+            print("Storing features in batches...")  # Debugging
             total_rows = len(df)
-            new_data_to_insert = []
-            for i in tqdm(range(0, total_rows, batch_size), desc="Filtering and preparing new data"):
+            for i in tqdm(range(0, total_rows, batch_size), desc="Storing features in batches"):
                 batch_df = df[i:i + batch_size]
-                for _, row in batch_df.iterrows():
-                    date = row['date']
-                    trading_symbol = row['trading_symbol']
-                    if (date, trading_symbol) not in existing_data:
-                        new_data_to_insert.append(tuple(row))
-
-            # 5. Execute the INSERT query for the new data in batches
-            total_new_rows = len(new_data_to_insert)
-            for i in tqdm(range(0, total_new_rows, batch_size), desc="Storing new features in batches"):
-                batch_data = new_data_to_insert[i:i + batch_size]
-                cursor.executemany(insert_query, batch_data)
+                data = [tuple(x) for x in batch_df.to_numpy()]
+                cursor.executemany(insert_query, data)
                 conn.commit()  # Commit after each batch
 
-            print(f"Successfully stored {total_new_rows} new rows in {table_name}")
+            print(f"Successfully stored {total_rows} rows in {table_name}")
 
-            conn.close()
+            cursor.close()
+            print("Exiting store_features function")  # Debugging
 
         except Exception as e:
             print(f"Error storing features in MySQL: {e}")
+            print(f"Exception type: {type(e)}")  # Debugging
+            print(f"Exception value: {e}")  # Debugging
             if 'conn' in locals():
-                conn.rollback()
-                conn.close()
+                try:
+                    conn.rollback()
+                except Exception as rollback_error:
+                    print(f"Error during rollback: {rollback_error}")
+                finally:
+                    conn.close()
 
 # Example Usage
 if __name__ == '__main__':
@@ -251,6 +250,16 @@ if __name__ == '__main__':
     df = feature_engineer.fetch_data(trading_symbols, start_date, end_date)
 
     # Create features
+    print("Data types before feature engineering:")  # Debugging
+    print(df.dtypes)  # Debugging
+
+    # Convert all numeric columns to float
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    df[numeric_cols] = df[numeric_cols].astype(float)
+
+    print("Data types after converting numeric columns to float:")  # Debugging
+    print(df.dtypes)  # Debugging
+
     if not df.empty:
         df_featured = feature_engineer.create_features(df.copy()) # Pass a copy to avoid modifying the original DataFrame
         print(df_featured.head())

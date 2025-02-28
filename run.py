@@ -32,7 +32,7 @@ class RateLimiter:
     """
     A thread-safe rate limiter to ensure API request limits are respected.
     """
-    def __init__(self, calls_per_second=1):
+    def __init__(self, calls_per_second=0.25):  # Change this to 0.25 (1 call per 4 seconds)
         self.calls_per_second = calls_per_second
         self.last_call_time = time.time()
         self.lock = Lock()
@@ -808,17 +808,6 @@ if __name__ == "__main__":
         "no"
     )
 
-    if refresh_choice == "yes":
-        print("[INFO] Refreshing symbol list...", flush=True)
-
-    # First ensure the database and user exist by running these MySQL commands:
-    """
-    CREATE DATABASE IF NOT EXISTS dhanhq_db;
-    CREATE USER IF NOT EXISTS 'dhan_hq'@'localhost' IDENTIFIED BY 'your_password';
-    GRANT ALL PRIVILEGES ON dhanhq_db.* TO 'dhan_hq'@'localhost';
-    FLUSH PRIVILEGES;
-    """
-    
     # Create tables if they don't exist
     connection = dhan.get_db_connection()
     if connection:
@@ -864,6 +853,7 @@ if __name__ == "__main__":
                     close DECIMAL(10,2),
                     volume DECIMAL(15,2),
                     timestamp DATETIME,
+                    market_cap DECIMAL(20,2),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -877,7 +867,11 @@ if __name__ == "__main__":
             cursor.close()
             connection.close()
 
-    # Fetch and filter security list
+    filtered_filename = "filtered_security_list.csv"
+    
+    if refresh_choice == "yes":
+        print("[INFO] Refreshing symbol list...", flush=True)
+        # Fetch and filter security list
         df = dhan.fetch_security_list("compact")
         if df is not None:
             # Filter for equity securities
@@ -886,31 +880,187 @@ if __name__ == "__main__":
                 (df['SEM_INSTRUMENT_NAME'] == 'EQUITY') &
                 (df['SEM_EXCH_INSTRUMENT_TYPE'] == 'ES')
             ]
-            filtered_filename = "filtered_security_list.csv"
             df.to_csv(filtered_filename, index=False)
     else:
         print("[INFO] Using existing symbols from database...", flush=True)
-        existing_symbols = dhan.get_existing_symbols()
-        if existing_symbols:
-            # Create filtered CSV with existing symbols only
-            df = pd.DataFrame({
-                'SEM_TRADING_SYMBOL': existing_symbols,
-                'SEM_EXM_EXCH_ID': ['NSE'] * len(existing_symbols),
-                'SEM_INSTRUMENT_NAME': ['EQUITY'] * len(existing_symbols),
-                'SEM_EXCH_INSTRUMENT_TYPE': ['ES'] * len(existing_symbols)
-            })
-            filtered_filename = "filtered_security_list.csv"
-            df.to_csv(filtered_filename, index=False)
-        else:
-            print("[ERROR] No existing symbols found in database", flush=True)
-            exit(1)
+        # Get detailed symbol information from database
+        connection = dhan.get_db_connection()
+        if connection:
+            try:
+                cursor = connection.cursor()
+                
+                # Fetch existing symbols with security_id and company_name
+                cursor.execute("""
+                    SELECT DISTINCT trading_symbol, security_id, company_name, exchange 
+                    FROM historical_data
+                """)
+                
+                existing_data = cursor.fetchall()
+                
+                if existing_data:
+                    # Create DataFrame with full data from database
+                    df = pd.DataFrame({
+                        'SEM_TRADING_SYMBOL': [row[0] for row in existing_data],
+                        'SEM_SMST_SECURITY_ID': [row[1] for row in existing_data],
+                        'SM_SYMBOL_NAME': [row[2] for row in existing_data],
+                        'SEM_EXM_EXCH_ID': [row[3].split('_')[0] for row in existing_data],
+                        'SEM_INSTRUMENT_NAME': ['EQUITY'] * len(existing_data),
+                        'SEM_EXCH_INSTRUMENT_TYPE': ['ES'] * len(existing_data)
+                    })
+                    df.to_csv(filtered_filename, index=False)
+                    print(f"[INFO] Retrieved {len(existing_data)} existing securities from database", flush=True)
+                else:
+                    print("[ERROR] No existing symbols found in database", flush=True)
+                    exit(1)
+            except Error as e:
+                print(f"[ERROR] Error retrieving data from database: {e}", flush=True)
+                exit(1)
+            finally:
+                cursor.close()
+                connection.close()
 
-    # Get date range from user
-    start_date = input("Enter start date (YYYY-MM-DD) or press enter for earliest available: ").strip()
-    end_date = input("Enter end date (YYYY-MM-DD) or press enter for today: ").strip()
-    
+    # Get date range from user with timeout
+    start_date = dhan.wait_for_input_with_timeout(
+        "Enter start date (YYYY-MM-DD) or press enter for earliest available",
+        10,  # 10 second timeout
+        ""   # Empty string as default
+    ).strip()
+
+    end_date = dhan.wait_for_input_with_timeout(
+        "Enter end date (YYYY-MM-DD) or press enter for today",
+        10,  # 10 second timeout
+        ""   # Empty string as default
+    ).strip()
+
     start_date = start_date if start_date else None
     end_date = end_date if end_date else None
+
+    # Modify the _process_single_security method to skip market cap check for existing symbols
+    if refresh_choice == "no":
+        # Store the original method
+        original_process_method = dhan._process_single_security
+        
+        # Define the modified method
+        def modified_process_method(security_info, start_date, end_date, connection_pool):
+            """Modified version that skips market cap check for existing symbols"""
+            try:
+                security_id = str(security_info["SEM_SMST_SECURITY_ID"])
+                exchange_segment = f"{security_info['SEM_EXM_EXCH_ID']}_EQ"
+                trading_symbol = security_info["SEM_TRADING_SYMBOL"].strip()
+                company_name = security_info.get("SM_SYMBOL_NAME", "").strip()
+
+                print(f"\n[INFO] Processing security: {trading_symbol} ({company_name})", flush=True)
+
+                # Skip market cap check - we trust existing symbols in database
+                # Get a connection from the pool
+                connection = connection_pool.get()
+                cursor = connection.cursor()
+
+                try:
+                    # Check latest data available in database
+                    cursor.execute("""
+                        SELECT MAX(date) as last_date 
+                        FROM historical_data 
+                        WHERE trading_symbol = %s
+                    """, (trading_symbol,))
+                    result = cursor.fetchone()
+                    last_date = result[0] if result[0] else None
+
+                    if last_date:
+                        # Calculate start date for new data fetch
+                        start_fetch_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                        
+                        # Calculate and log the number of days we need to fetch
+                        days_to_fetch = (datetime.strptime(end_date, "%Y-%m-%d").date() - last_date).days
+                        print(f"[INFO] Found existing data up to {last_date}. Need to fetch {days_to_fetch} days of new data.", flush=True)
+                        
+                        # Check if we already have up-to-date data
+                        if datetime.strptime(start_fetch_date, "%Y-%m-%d").date() > datetime.strptime(end_date, "%Y-%m-%d").date():
+                            print(f"[INFO] Data already up to date for {trading_symbol}", flush=True)
+                            return
+                            
+                        # Validate that start date isn't after end date
+                        if start_fetch_date > end_date:
+                            print(f"[WARNING] Start date {start_fetch_date} is after end date {end_date}. Skipping {trading_symbol}", flush=True)
+                            return
+                            
+                        # Check for future dates
+                        if datetime.strptime(start_fetch_date, "%Y-%m-%d").date() > datetime.now().date():
+                            print(f"[WARNING] Start date {start_fetch_date} is in the future. Adjusting to today's date.", flush=True)
+                            start_fetch_date = datetime.now().date().strftime("%Y-%m-%d")
+                    else:
+                        start_fetch_date = start_date
+
+                    print(f"[INFO] Fetching data from {start_fetch_date} to {end_date} for {trading_symbol}", flush=True)
+
+                    # Apply rate limiting before making API call
+                    dhan.rate_limiter.wait()
+
+                    response = dhan.historical_daily_data(
+                        security_id=security_id,
+                        exchange_segment=exchange_segment,
+                        instrument_type="EQUITY",
+                        from_date=start_fetch_date,
+                        to_date=end_date,
+                        expiry_code=0
+                    )
+
+                    if response and response.get("status") == "success":
+                        data = response.get("data", {})
+                        if data and all(key in data for key in ["timestamp", "open", "high", "low", "close", "volume"]):
+                            records = []
+                            for i in range(len(data["timestamp"])):
+                                record = {
+                                    "date": datetime.fromtimestamp(data["timestamp"][i]).strftime("%Y-%m-%d"),
+                                    "trading_symbol": trading_symbol,
+                                    "company_name": company_name,
+                                    "exchange": exchange_segment,
+                                    "security_id": security_id,
+                                    "open": data["open"][i],
+                                    "high": data["high"][i],
+                                    "low": data["low"][i],
+                                    "close": data["close"][i],
+                                    "volume": data["volume"][i],
+                                    "timestamp": datetime.fromtimestamp(data["timestamp"][i]).strftime("%Y-%m-%d %H:%M:%S"),
+                                    "market_cap": 0  # Default value since we're skipping market cap check
+                                }
+                                records.append(record)
+
+                            if records:
+                                # Insert records in batches
+                                batch_size = 1000
+                                for i in range(0, len(records), batch_size):
+                                    batch = records[i:i + batch_size]
+                                    cursor.executemany("""
+                                        INSERT INTO historical_data 
+                                        (date, trading_symbol, company_name, exchange, 
+                                        security_id, open, high, low, close, volume, 
+                                        timestamp, market_cap)
+                                        VALUES (%(date)s, %(trading_symbol)s, %(company_name)s, 
+                                        %(exchange)s, %(security_id)s, %(open)s, %(high)s, 
+                                        %(low)s, %(close)s, %(volume)s, %(timestamp)s, 
+                                        %(market_cap)s)
+                                    """, batch)
+                                    connection.commit()
+
+                                print(f"[INFO] Added {len(records)} new records for {trading_symbol}", flush=True)
+                            else:
+                                print(f"[INFO] No new data available for {trading_symbol}", flush=True)
+                        else:
+                            print(f"[WARNING] Invalid data format received for {trading_symbol}", flush=True)
+                    else:
+                        error_msg = response.get("remarks", "Unknown error")
+                        print(f"[ERROR] Failed to fetch data for {trading_symbol}: {error_msg}", flush=True)
+
+                finally:
+                    cursor.close()
+                    connection_pool.put(connection)
+
+            except Exception as e:
+                print(f"[ERROR] Error processing {trading_symbol}: {str(e)}", flush=True)
+        
+        # Replace the original method with our modified version
+        dhan._process_single_security = modified_process_method
 
     # Fetch historical data
     dhan.fetch_and_save_historical_data(filtered_filename, start_date, end_date, max_workers=6)

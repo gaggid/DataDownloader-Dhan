@@ -102,6 +102,51 @@ def clean_database_data():
         else:
             log_message("No duplicate symbol-date combinations found", "INFO")
 
+        # After cleaning duplicates, identify and remove symbols with fewer than 365 days of data
+        log_message("Identifying symbols with less than 365 days of data...", "INFO")
+        cursor.execute("""
+            SELECT 
+                trading_symbol,
+                COUNT(*) as record_count
+            FROM historical_data
+            GROUP BY trading_symbol
+            HAVING record_count < 365
+        """)
+        
+        short_history_symbols = cursor.fetchall()
+        
+        if short_history_symbols:
+            symbol_count = len(short_history_symbols)
+            log_message(f"Found {symbol_count} symbols with less than 365 days of data", "WARNING")
+            
+            # Display some examples
+            for symbol in short_history_symbols[:5]:
+                log_message(f"Symbol: {symbol[0]}, Records: {symbol[1]}", "INFO")
+            if symbol_count > 5:
+                log_message(f"... and {symbol_count-5} more", "INFO")
+            
+            # Get count before deletion
+            cursor.execute("SELECT COUNT(*) FROM historical_data")
+            total_before = cursor.fetchone()[0]
+            
+            # Delete records for symbols with insufficient data
+            symbol_list = [symbol[0] for symbol in short_history_symbols]
+            format_strings = ','.join(['%s'] * len(symbol_list))
+            delete_query = f"""
+                DELETE FROM historical_data 
+                WHERE trading_symbol IN ({format_strings})
+            """
+            cursor.execute(delete_query, symbol_list)
+            
+            # Get count after deletion
+            cursor.execute("SELECT COUNT(*) FROM historical_data")
+            total_after = cursor.fetchone()[0]
+            
+            deleted_count = total_before - total_after
+            log_message(f"Removed {deleted_count} records for {symbol_count} symbols with insufficient history", "INFO")
+        else:
+            log_message("No symbols found with less than 365 days of data", "INFO")
+
         # Commit changes
         connection.commit()
 

@@ -1,0 +1,10 @@
+return_90
+trix
+di_minus_14
+return_180
+sma_200
+return_365
+return_55
+macd_histogram
+natr
+cci_20

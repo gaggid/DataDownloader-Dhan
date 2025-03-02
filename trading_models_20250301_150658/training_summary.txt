@@ -1,0 +1,30 @@
+Training Summary Report
+=====================
+
+Date: 2025-03-01 15:08:07
+Total Execution Time: 69.85 seconds
+
+Models Trained: 20 symbols
+Best Models Selected: 14 symbols
+
+Best Model Distribution:
+  - catboost: 9 symbols (64.3%)
+  - lightgbm: 3 symbols (21.4%)
+  - xgboost: 2 symbols (14.3%)
+
+Symbol-wise Best Models:
+------------------------
+ASIANPAINT: catboost (AUC=0.7367)
+AXISBANK: lightgbm (AUC=0.8978)
+BAJFINANCE: catboost (AUC=0.9231)
+BHARTIARTL: catboost (AUC=0.6341)
+ICICIBANK: xgboost (AUC=0.8922)
+INFY: catboost (AUC=0.9268)
+MARUTI: lightgbm (AUC=1.0000)
+RELIANCE: catboost (AUC=0.9186)
+SBIN: catboost (AUC=0.9487)
+SUNPHARMA: lightgbm (AUC=0.8503)
+TATAMOTORS: catboost (AUC=0.8652)
+TITAN: xgboost (AUC=0.7944)
+ULTRACEMCO: catboost (AUC=0.9020)
+WIPRO: catboost (AUC=0.9475)

@@ -202,47 +202,62 @@ class dhanhq:
     
     def get_market_cap(self, symbol):
         """
-        Fetch market cap for a given symbol using yfinance.
-        Tries both .NS and -SM.NS suffixes for NSE symbols.
-        Skips symbols with market cap less than 500M.
-
-        Args:
-            symbol (str): Trading symbol of the security
-            
-        Returns:
-            float or None: Market capitalization value if available and above threshold, None otherwise
+        Fetch market cap for a given symbol using a local CSV file.
+        All symbols found in the CSV are considered to have sufficient market cap.
         """
-        MARKET_CAP_THRESHOLD = 500000000  # 500M threshold
+        CSV_PATH = "market_cap.csv"  # Base filename
 
         try:
-            # First try with .NS suffix
-            yf_symbol = f"{symbol}.NS"
-            stock = yf.Ticker(yf_symbol)
-            info = stock.info
-            market_cap = info.get('marketCap')
+            # Try multiple possible locations for the CSV file
+            possible_paths = [
+                CSV_PATH,  # Simple relative path
+                os.path.join(os.getcwd(), CSV_PATH),  # Current working directory
+                os.path.abspath(CSV_PATH),  # Absolute path
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), CSV_PATH)  # Script directory
+            ]
             
-            # If market cap not found, try with -SM.NS suffix
-            if market_cap is None:
-                print(f"[INFO] Trying alternate symbol format for {symbol}", flush=True)
-                yf_symbol = f"{symbol}-SM.NS"
-                stock = yf.Ticker(yf_symbol)
-                info = stock.info
-                market_cap = info.get('marketCap')
-                
-            if market_cap is not None:
-                # Check if market cap is below threshold
-                if market_cap < MARKET_CAP_THRESHOLD:
-                    print(f"[INFO] Skipping {symbol} - Market cap ({market_cap:,}) below threshold ({MARKET_CAP_THRESHOLD:,})", flush=True)
-                    return None
-                else:
-                    print(f"[INFO] Successfully fetched market cap for {symbol} using {yf_symbol}: {market_cap:,}", flush=True)
-                    return market_cap
-            else:
-                print(f"[WARNING] Market cap not available for {symbol} with either suffix", flush=True)
+            csv_file_path = None
+            for path in possible_paths:
+                if os.path.exists(path):
+                    csv_file_path = path
+                    print(f"[INFO] Found market cap CSV at: {path}", flush=True)
+                    break
+            
+            if not csv_file_path:
+                print(f"[ERROR] Market cap CSV file not found for {symbol}", flush=True)
                 return None
             
+            # Load the CSV file if not already loaded
+            if not hasattr(self, 'market_cap_df') or self.market_cap_df is None:
+                try:
+                    self.market_cap_df = pd.read_csv(csv_file_path)
+                    print(f"[INFO] Loaded market cap data for {len(self.market_cap_df)} companies", flush=True)
+                    
+                    # Create uppercase version for matching
+                    nse_code_col = 'NSE Code' if 'NSE Code' in self.market_cap_df.columns else self.market_cap_df.columns[1]
+                    self.market_cap_df['Symbol_Upper'] = self.market_cap_df[nse_code_col].str.strip().str.upper()
+                except Exception as e:
+                    print(f"[ERROR] Failed to parse market cap CSV: {e}", flush=True)
+                    return None
+            
+            # Find the symbol in the CSV
+            symbol = symbol.strip().upper()
+            match = self.market_cap_df[self.market_cap_df['Symbol_Upper'] == symbol]
+            
+            if len(match) > 0:
+                # Get the market cap value
+                market_cap_col = 'Market Capitalization' if 'Market Capitalization' in self.market_cap_df.columns else self.market_cap_df.columns[2]
+                market_cap = float(match.iloc[0][market_cap_col])
+                
+                # If symbol is found in CSV, consider it has sufficient market cap
+                print(f"[INFO] Found market cap for {symbol}: {market_cap} crores - will process", flush=True)
+                return market_cap  # Return the market cap value
+            else:
+                print(f"[INFO] No market cap data found for {symbol} in local file", flush=True)
+                return None
+                    
         except Exception as e:
-            print(f"[ERROR] Failed to fetch market cap for {symbol}: {e}", flush=True)
+            print(f"[ERROR] Error fetching market cap for {symbol} from local file: {e}", flush=True)
             return None
     
     def _process_volume_filter_for_symbol(self, trading_symbol, connection_pool, volume_threshold):
@@ -397,11 +412,11 @@ class dhanhq:
 
             print(f"\n[INFO] Processing security: {trading_symbol} ({company_name})", flush=True)
 
-            MARKET_CAP_THRESHOLD = 500000000  # 500M threshold
+            # MARKET_CAP_THRESHOLD = 500000000  # 500M threshold
 
             # Fetch market cap and check if we should process this security
             market_cap = self.get_market_cap(trading_symbol)
-            if market_cap is None or market_cap < MARKET_CAP_THRESHOLD:
+            if market_cap is None:  # Only skip if market_cap is None, not if it's any value
                 print(f"[INFO] Skipping {trading_symbol} due to insufficient market cap or missing data", flush=True)
                 return
 
@@ -688,33 +703,68 @@ class dhanhq:
             print(f"[ERROR] Failed to fetch security list: {e}", flush=True)
             return None
 
-    def fetch_and_save_historical_data(self, input_csv, start_date=None, end_date=None, max_workers=3):
-        """
-        Reads the filtered CSV file and retrieves historical daily data for all securities using multiple threads.
-        Includes proper cleanup handling for interruptions.
-        """
+    def fetch_and_save_historical_data(self, input_csv, start_date=None, end_date=None, max_workers=3, include_indices=True):
         active_connections = []  # Keep track of all database connections
         executor = None
+        """
+        Reads the filtered CSV file and retrieves historical daily data for securities and indices using multiple threads.
+        Includes proper cleanup handling for interruptions.
         
+        Args:
+            input_csv (str): Path to the CSV file with security information
+            start_date (str): Start date for historical data in YYYY-MM-DD format
+            end_date (str): End date for historical data in YYYY-MM-DD format
+            max_workers (int): Number of worker threads to use
+            include_indices (bool): Whether to include index data
+        """
+       
         try:
             print("[INFO] Starting multithreaded historical data fetch...", flush=True)
             
             # Read and sort the data
             df = pd.read_csv(input_csv)
-            df = df.sort_values(by='SEM_TRADING_SYMBOL', ascending=True)
+            
+            # Debug output
+            print(f"[DEBUG] CSV columns: {list(df.columns)}", flush=True)
+            if 'SEM_INSTRUMENT_NAME' in df.columns:
+                unique_instruments = df['SEM_INSTRUMENT_NAME'].unique()
+                print(f"[DEBUG] Unique instrument names: {unique_instruments}", flush=True)
+            
+            # Create two separate dataframes - one for equities and one for indices
+            df_equities = df[
+                (df['SEM_EXM_EXCH_ID'].isin(['BSEEE', 'NSE'])) &
+                (df['SEM_INSTRUMENT_NAME'] == 'EQUITY') &
+                (df['SEM_EXCH_INSTRUMENT_TYPE'] == 'ES')
+            ].sort_values(by='SEM_TRADING_SYMBOL', ascending=True)
+            
+            # Filter for indices - use uppercase INDEX
+            df_indices = pd.DataFrame()
+            if include_indices:
+                # Filter for pure indices (not futures/options on indices)
+                df_indices = df[
+                    (df['SEM_EXM_EXCH_ID'] == 'NSE') &
+                    (df['SEM_INSTRUMENT_NAME'] == 'INDEX') &
+                    (~df['SEM_TRADING_SYMBOL'].str.contains('FUT|OPT', case=False, na=False))  # Exclude futures/options
+                ].sort_values(by='SEM_TRADING_SYMBOL', ascending=True)
+                
+                # Print first few indices for verification
+                if len(df_indices) > 0:
+                    print(f"[INFO] First 5 indices to be processed:", flush=True)
+                    for idx, row in df_indices.head().iterrows():
+                        print(f"  - {row['SEM_TRADING_SYMBOL']}", flush=True)
+            
+            total_securities = len(df_equities)
+            total_indices = len(df_indices)
             
             # Log the processing information
-            print(f"[INFO] Processing {len(df)} securities in alphabetical order", flush=True)
-            print("[INFO] First 5 securities to be processed:", flush=True)
-            for idx, row in df.head().iterrows():
-                print(f"  - {row['SEM_TRADING_SYMBOL']}", flush=True)
+            print(f"[INFO] Processing {total_securities} equities and {total_indices} indices", flush=True)
             
             # Set up date range
             if end_date is None:
                 end_date = datetime.now().date() + timedelta(days=1)
             else:
                 end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
-                
+                    
             if start_date is None:
                 start_date = datetime(2015, 1, 1).date()
             else:
@@ -730,44 +780,71 @@ class dhanhq:
                 connection = self.get_db_connection()
                 if connection:
                     connection_pool.put(connection)
-                    active_connections.append(connection)  # Track connections for cleanup
+                    active_connections.append(connection)
 
-            # Process securities with proper exception handling
+            # Create thread pool executor
             executor = ThreadPoolExecutor(max_workers=max_workers)
-            futures = []
-            try:
-                for _, row in df.iterrows():
+            
+            # Process indices first
+            if include_indices and len(df_indices) > 0:
+                print("[INFO] About to process indices...", flush=True)
+                if len(df_indices) > 0:
+                    print(f"[DEBUG] First index to process: {df_indices.iloc[0]['SEM_TRADING_SYMBOL']}", flush=True)
+                
+                # Create futures for indices
+                index_futures = []
+                for _, row in df_indices.iterrows():
                     future = executor.submit(
-                        self._process_single_security,
-                        security_info=row.to_dict(),
+                        self._process_single_index,
+                        index_info=row.to_dict(),
                         start_date=from_date,
                         end_date=to_date,
                         connection_pool=connection_pool
                     )
-                    futures.append(future)
-
-                # Track progress with interruption handling
-                total_securities = len(futures)
-                completed = 0
+                    index_futures.append(future)
                 
-                for future in as_completed(futures):
+                # Wait for indices to complete
+                completed_indices = 0
+                for future in as_completed(index_futures):
                     try:
                         future.result()
-                        completed += 1
-                        if completed % 10 == 0:
-                            print(f"[INFO] Progress: {completed}/{total_securities} securities processed", flush=True)
+                        completed_indices += 1
+                        print(f"[INFO] Progress: {completed_indices}/{total_indices} indices processed", flush=True)
                     except Exception as e:
-                        print(f"[ERROR] Thread execution failed: {str(e)}", flush=True)
-
-            except KeyboardInterrupt:
-                print("\n[INFO] Received interruption signal. Cleaning up...", flush=True)
-                # Cancel pending futures
-                for future in futures:
-                    future.cancel()
-                raise  # Re-raise to handle cleanup in outer try block
+                        print(f"[ERROR] Thread execution failed for index: {str(e)}", flush=True)
+                
+                print(f"[INFO] Completed processing {completed_indices} indices", flush=True)
+            
+            # Now process equities
+            print("[INFO] Now processing equities...", flush=True)
+            equity_futures = []
+            for _, row in df_equities.iterrows():
+                future = executor.submit(
+                    self._process_single_security,
+                    security_info=row.to_dict(),
+                    start_date=from_date,
+                    end_date=to_date,
+                    connection_pool=connection_pool
+                )
+                equity_futures.append(future)
+            
+            # Wait for equities to complete
+            completed_equities = 0
+            for future in as_completed(equity_futures):
+                try:
+                    future.result()
+                    completed_equities += 1
+                    if completed_equities % 10 == 0:
+                        print(f"[INFO] Progress: {completed_equities}/{total_securities} equities processed", flush=True)
+                except Exception as e:
+                    print(f"[ERROR] Thread execution failed for equity: {str(e)}", flush=True)
 
         except KeyboardInterrupt:
-            print("\n[INFO] Shutting down gracefully...", flush=True)
+            print("\n[INFO] Received interruption signal. Cleaning up...", flush=True)
+            if executor:
+                # Cancel any pending futures
+                executor.shutdown(wait=False)
+            raise
         except Exception as e:
             print(f"[ERROR] Exception in fetch_and_save_historical_data: {str(e)}", flush=True)
             import traceback
@@ -791,6 +868,155 @@ class dhanhq:
                     print(f"[WARNING] Error closing connection: {e}", flush=True)
             
             print("[INFO] Cleanup completed", flush=True)
+    def _process_single_index(self, index_info, start_date, end_date, connection_pool):
+        """
+        Process a single index's historical data
+        
+        Args:
+            index_info (dict): Dictionary containing index information
+            start_date (str): Start date for historical data in YYYY-MM-DD format
+            end_date (str): End date for historical data in YYYY-MM-DD format
+            connection_pool (Queue): Pool of database connections
+        """
+        try:
+            security_id = str(int(index_info["SEM_SMST_SECURITY_ID"]))
+            exchange_segment = "NSE_Indx"  # Special exchange identifier for indices
+            trading_symbol = index_info["SEM_TRADING_SYMBOL"].strip()
+            index_name = index_info.get("SM_SYMBOL_NAME", trading_symbol).strip()
+
+            print(f"\n[INFO] Processing index: {trading_symbol} ({index_name})", flush=True)
+
+            # Get a connection from the pool
+            connection = connection_pool.get()
+            cursor = connection.cursor()
+
+            try:
+                # Check latest data available in database
+                cursor.execute("""
+                    SELECT MAX(date) as last_date 
+                    FROM historical_data 
+                    WHERE security_id = %s AND exchange = %s
+                """, (security_id, exchange_segment))
+                result = cursor.fetchone()
+                last_date = result[0] if result[0] else None
+
+                if last_date:
+                    # Calculate start date for new data fetch
+                    start_fetch_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                    
+                    # Calculate and log the number of days we need to fetch
+                    days_to_fetch = (datetime.strptime(end_date, "%Y-%m-%d").date() - last_date).days
+                    print(f"[INFO] Found existing data up to {last_date}. Need to fetch {days_to_fetch} days of new data.", flush=True)
+                    
+                    # Check if we already have up-to-date data
+                    if datetime.strptime(start_fetch_date, "%Y-%m-%d").date() >= datetime.strptime(end_date, "%Y-%m-%d").date():
+                        print(f"[INFO] Data already up to date for index {trading_symbol}", flush=True)
+                        return
+                        
+                    # Validate that start date isn't after end date
+                    if start_fetch_date > end_date:
+                        print(f"[WARNING] Start date {start_fetch_date} is after end date {end_date}. Skipping index {trading_symbol}", flush=True)
+                        return
+                        
+                    # Check for future dates
+                    if datetime.strptime(start_fetch_date, "%Y-%m-%d").date() > datetime.now().date():
+                        print(f"[WARNING] Start date {start_fetch_date} is in the future. Adjusting to today's date.", flush=True)
+                        start_fetch_date = datetime.now().date().strftime("%Y-%m-%d")
+                else:
+                    start_fetch_date = start_date
+
+                print(f"[INFO] Fetching index data from {start_fetch_date} to {end_date}", flush=True)
+
+                # Apply rate limiting before making API call
+                self.rate_limiter.wait()
+
+                # For indices, we use INDEX as the instrument_type
+                response = self.historical_daily_data(
+                    security_id=security_id,
+                    exchange_segment=self.INDEX,  # This should be 'IDX_I'
+                    instrument_type="INDEX",
+                    from_date=start_fetch_date,
+                    to_date=end_date,
+                    expiry_code=0
+                )
+
+                if response and response.get("status") == "success":
+                    data = response.get("data", {})
+                    if data and all(key in data for key in ["timestamp", "open", "high", "low", "close", "volume"]):
+                        records = []
+                        for i in range(len(data["timestamp"])):
+                            record = {
+                                "date": datetime.fromtimestamp(data["timestamp"][i]).strftime("%Y-%m-%d"),
+                                "trading_symbol": trading_symbol,
+                                "company_name": index_name,
+                                "exchange": exchange_segment,  # Use NSE_Indx as exchange
+                                "security_id": security_id,
+                                "open": data["open"][i],
+                                "high": data["high"][i],
+                                "low": data["low"][i],
+                                "close": data["close"][i],
+                                "volume": data["volume"][i] if data["volume"][i] is not None else 0,  # Some indices might not have volume
+                                "timestamp": datetime.fromtimestamp(data["timestamp"][i]).strftime("%Y-%m-%d %H:%M:%S"),
+                                "market_cap": 0  # Indices don't have market cap
+                            }
+                            records.append(record)
+
+                        if records:
+                            # Insert records in batches
+                            batch_size = 1000
+                            for i in range(0, len(records), batch_size):
+                                batch = records[i:i + batch_size]
+                                cursor.executemany("""
+                                    INSERT INTO historical_data 
+                                    (date, trading_symbol, company_name, exchange, 
+                                    security_id, open, high, low, close, volume, 
+                                    timestamp, market_cap)
+                                    VALUES (%(date)s, %(trading_symbol)s, %(company_name)s, 
+                                    %(exchange)s, %(security_id)s, %(open)s, %(high)s, 
+                                    %(low)s, %(close)s, %(volume)s, %(timestamp)s, 
+                                    %(market_cap)s)
+                                """, batch)
+                                connection.commit()
+
+                            print(f"[INFO] Added {len(records)} new records for index {trading_symbol}", flush=True)
+                        else:
+                            print(f"[INFO] No new data available for index {trading_symbol}", flush=True)
+
+                else:
+                    error_msg = response.get("remarks", "Unknown error")
+                    print(f"[ERROR] Failed to fetch data for index {trading_symbol}: {error_msg}", flush=True)
+
+            finally:
+                cursor.close()
+                connection_pool.put(connection)
+
+        except Exception as e:
+            print(f"[ERROR] Error processing index {trading_symbol}: {str(e)}", flush=True)
+    def inspect_security_list(self, filename):
+        """Debug utility to inspect security list files"""
+        try:
+            print(f"[DEBUG] Inspecting file: {filename}", flush=True)
+            if not os.path.exists(filename):
+                print(f"[ERROR] File does not exist: {filename}", flush=True)
+                return
+                
+            df = pd.read_csv(filename)
+            print(f"[DEBUG] File has {len(df)} rows and columns: {list(df.columns)}", flush=True)
+            
+            # Look for indices 
+            if 'SEM_INSTRUMENT_NAME' in df.columns:
+                indices = df[df['SEM_INSTRUMENT_NAME'].str.contains('INDEX', case=False)]
+                print(f"[DEBUG] Found {len(indices)} potential indices", flush=True)
+                if len(indices) > 0:
+                    print(f"[DEBUG] Sample index entry:\n{indices.iloc[0].to_dict()}", flush=True)
+            
+            # Check records that will be used for filtering
+            print(f"[DEBUG] Unique values in key columns:")
+            for col in df.columns:
+                if 'INSTRUMENT' in col.upper() or 'TYPE' in col.upper() or 'EXCH' in col.upper():
+                    print(f"  - {col}: {df[col].unique()}", flush=True)
+        except Exception as e:
+            print(f"[ERROR] Error inspecting security list: {e}", flush=True)
 
 if __name__ == "__main__":
     # Get database password
@@ -807,6 +1033,14 @@ if __name__ == "__main__":
         10,
         "no"
     )
+
+    # Ask user about including indices
+    include_indices_choice = dhan.wait_for_input_with_timeout(
+        "Do you want to include index data? (yes/no)",
+        10,
+        "yes"
+    )
+    include_indices = include_indices_choice.lower() == "yes"
 
     # Create tables if they don't exist
     connection = dhan.get_db_connection()
@@ -874,13 +1108,28 @@ if __name__ == "__main__":
         # Fetch and filter security list
         df = dhan.fetch_security_list("compact")
         if df is not None:
-            # Filter for equity securities
-            df = df[
-                (df['SEM_EXM_EXCH_ID'].isin(['BSEEE', 'NSE'])) &
-                (df['SEM_INSTRUMENT_NAME'] == 'EQUITY') &
-                (df['SEM_EXCH_INSTRUMENT_TYPE'] == 'ES')
-            ]
-            df.to_csv(filtered_filename, index=False)
+            # Filter for equity securities and optionally indices
+            if include_indices:
+                # Change 'Index' to 'INDEX' to match actual data
+                df_filtered = df[
+                    ((df['SEM_EXM_EXCH_ID'].isin(['BSEEE', 'NSE'])) &
+                    (df['SEM_INSTRUMENT_NAME'] == 'EQUITY') &
+                    (df['SEM_EXCH_INSTRUMENT_TYPE'] == 'ES')) |
+                    ((df['SEM_EXM_EXCH_ID'] == 'NSE') &
+                    (df['SEM_INSTRUMENT_NAME'].str.upper() == 'INDEX'))  # Case-insensitive match
+                ]
+            else:
+                df_filtered = df[
+                    (df['SEM_EXM_EXCH_ID'].isin(['BSEEE', 'NSE'])) &
+                    (df['SEM_INSTRUMENT_NAME'] == 'EQUITY') &
+                    (df['SEM_EXCH_INSTRUMENT_TYPE'] == 'ES')
+                ]
+            # After filtering the security list
+            df_filtered.to_csv(filtered_filename, index=False)
+            print(f"[INFO] Filtered security list saved to {filtered_filename}", flush=True)
+
+            # Inspect the filtered list
+            dhan.inspect_security_list(filtered_filename)
     else:
         print("[INFO] Using existing symbols from database...", flush=True)
         # Get detailed symbol information from database
@@ -904,11 +1153,22 @@ if __name__ == "__main__":
                         'SEM_SMST_SECURITY_ID': [row[1] for row in existing_data],
                         'SM_SYMBOL_NAME': [row[2] for row in existing_data],
                         'SEM_EXM_EXCH_ID': [row[3].split('_')[0] for row in existing_data],
-                        'SEM_INSTRUMENT_NAME': ['EQUITY'] * len(existing_data),
-                        'SEM_EXCH_INSTRUMENT_TYPE': ['ES'] * len(existing_data)
+                        'SEM_INSTRUMENT_NAME': [
+                            'Index' if row[3] == 'NSE_Indx' else 'EQUITY' 
+                            for row in existing_data
+                        ],
+                        'SEM_EXCH_INSTRUMENT_TYPE': [
+                            'IDX' if row[3] == 'NSE_Indx' else 'ES' 
+                            for row in existing_data
+                        ]
                     })
+                    
+                    # Filter indices if requested
+                    if not include_indices:
+                        df = df[df['SEM_INSTRUMENT_NAME'] == 'EQUITY']
+                        
                     df.to_csv(filtered_filename, index=False)
-                    print(f"[INFO] Retrieved {len(existing_data)} existing securities from database", flush=True)
+                    print(f"[INFO] Retrieved {len(df)} existing securities from database", flush=True)
                 else:
                     print("[ERROR] No existing symbols found in database", flush=True)
                     exit(1)
@@ -1062,10 +1322,17 @@ if __name__ == "__main__":
         # Replace the original method with our modified version
         dhan._process_single_security = modified_process_method
 
-    # Fetch historical data
-    dhan.fetch_and_save_historical_data(filtered_filename, start_date, end_date, max_workers=6)
+    # Fetch historical data with indices option
+    dhan.fetch_and_save_historical_data(
+        filtered_filename, 
+        start_date, 
+        end_date, 
+        max_workers=6,
+        include_indices=include_indices
+    )
     
     # Apply volume filtering only if we refreshed the symbol list
+    # This will only affect equity symbols, not indices
     if refresh_choice == "yes":
         print("\n[INFO] Applying volume filters to downloaded data...", flush=True)
         dhan.filter_low_volume_securities(max_workers=10)

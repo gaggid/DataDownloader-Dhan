@@ -94,8 +94,8 @@ class dhanhq:
     client_id = "1000363258"
     access_token = (
         "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9."
-        "eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQxNzAyMTIyLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTAwMDM2MzI1OCJ9."
-        "Rj23-14hZFPwa_VzhagzwXys7YywccUhZZTGDvS-lYbrDEynFgIRjtQue8mICp4joTWeWvlgHkAmrFxmuMNCgw"
+        "eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQzOTM4MTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTAwMDM2MzI1OCJ9."
+        "1Yyh9DyCENS6bkohN2PAJGDMEA-IcwAQqmFgLqgG3s-fSdoplx-XUjoGOsyTJIYnR29E5-wQJVbSPDAvbEodag"
     )
 
     def __init__(self, client_id, access_token, disable_ssl=False, pool=None, db_password=None):

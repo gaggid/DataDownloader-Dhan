@@ -362,7 +362,7 @@ class TechnicalIndicatorCalculator:
                     try:
                         # Calculate percentage change for both stock and Nifty
                         stock_pct = merged_df['close_stock'].pct_change(period)
-                        nifty_pct = merged_df['close_nifty'].pct_change(period)
+                        nifty_pct = merged_df['close_nifty'].pct_change(period, fill_method=None)
                         
                         # Calculate relative strength (stock performance relative to Nifty)
                         # Add a small number to avoid division by zero

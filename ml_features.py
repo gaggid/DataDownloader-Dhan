@@ -9,6 +9,7 @@ import logging
 import sys
 from typing import List, Dict, Optional, Union, Tuple, Any
 
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -57,7 +58,7 @@ class FeatureEngineering:
             cursor = conn.cursor(dictionary=True)
 
             # Process in batches to avoid memory issues
-            batch_size = 50  # Process 50 symbols at a time
+            batch_size = 100  # Process 50 symbols at a time
             all_data = []
             
             for i in range(0, len(trading_symbols), batch_size):
@@ -68,13 +69,10 @@ class FeatureEngineering:
                     SELECT
                         hd.date,
                         hd.trading_symbol,
-                        hd.open,
-                        hd.high,
-                        hd.low,
-                        hd.close,
-                        hd.volume,
+                        hd.open, hd.high, hd.low, hd.close, hd.volume,
                         ti.sma_20, ti.sma_50, ti.sma_200,
                         ti.ema_20, ti.ema_50,
+                        ti.vama_20d, ti.vpci_20d, ti.volume_sma_50d, ti.nifty_corr_full,
                         ti.macd_line, ti.macd_signal, ti.macd_histogram,
                         ti.adx_14, ti.di_plus_14, ti.di_minus_14,
                         ti.bollinger_upper, ti.bollinger_middle, ti.bollinger_lower,
@@ -83,7 +81,21 @@ class FeatureEngineering:
                         ti.stochastic_k, ti.stochastic_d,
                         ti.cci_20, ti.mfi_14, ti.williams_r, ti.roc,
                         ti.trix, ti.ultosc, ti.bop, ti.stddev, ti.var,
-                        ti.return_20, ti.return_55, ti.return_90, ti.return_180, ti.return_365
+                        ti.return_1d, ti.return_3d, ti.return_5d, ti.return_10d, 
+                        ti.return_20d, ti.return_40d, ti.return_60d, ti.return_120d,
+                        -- Additional calendar features
+                        ti.day_of_week, ti.day_of_month, ti.month, ti.quarter,
+                        ti.is_weekday_1, ti.is_weekday_2, ti.is_weekday_3, ti.is_weekday_4, ti.is_weekday_5,
+                        ti.is_month_start, ti.is_month_end, ti.is_quarter_start, ti.is_quarter_end,
+                        -- Correlation features
+                        ti.nifty_corr_20d, ti.nifty_corr_60d, ti.nifty_corr_120d, 
+                        -- Relative strength features
+                        ti.rs_nifty_5d, ti.rs_nifty_10d, ti.rs_nifty_20d, ti.rs_nifty_60d, ti.rs_nifty_120d,
+                        -- Volume metrics
+                        ti.volume_sma_5d, ti.volume_sma_10d, ti.volume_sma_20d, ti.volume_ratio_20d,
+                        ti.volume_roc_1d, ti.volume_roc_5d, ti.volume_roc_10d,
+                        -- Money flow indicators
+                        ti.cmf_20d, ti.pvt, ti.volume_oscillator, ti.eom_14d
                     FROM
                         historical_data hd
                     JOIN
@@ -138,7 +150,7 @@ class FeatureEngineering:
             return pd.DataFrame()
 
     def create_features(self, df: pd.DataFrame, prediction_horizon: int = 5, 
-                        lag_days: List[int] = [1, 2, 3, 5, 10], 
+                        lag_days: List[int] = [1, 2, 3, 5, 10, 15, 20],
                         threshold: float = 0.01) -> pd.DataFrame:
         """
         Creates features and target variable for machine learning.
@@ -211,43 +223,208 @@ class FeatureEngineering:
             symbol_df = symbol_df.sort_values('date')
             
             try:
+                # Apply optimized NaN handling for technical indicators
+                # This is more effective than just dropping rows with NaNs
+                symbol_df = self.clean_data_for_ml(symbol_df)
+                
+                # Instead of adding features one by one, create a dictionary of features
+                new_features = {}
+                
                 # 1. Lagged Features - process each column individually
                 for lag in lag_days:
                     for col in ['open', 'high', 'low', 'close', 'volume', 'sma_20', 'rsi_14', 'macd_line', 'atr_14']:
                         if col in symbol_df.columns:
-                            symbol_df[f'{col}_lag{lag}'] = symbol_df[col].shift(lag)
+                            new_features[f'{col}_lag{lag}'] = symbol_df[col].shift(lag)
                 
                 # 2. Derived Features
-                symbol_df['prev_close'] = symbol_df['close'].shift(1)
-                symbol_df['prev_volume'] = symbol_df['volume'].shift(1)
+                new_features['prev_close'] = symbol_df['close'].shift(1)
+                new_features['prev_volume'] = symbol_df['volume'].shift(1)
                 
-                # Avoid division by zero or very small numbers
-                symbol_df['price_change'] = (symbol_df['close'] - symbol_df['prev_close']) / (symbol_df['prev_close'].replace(0, np.nan) + 1e-6)
-                symbol_df['volume_change'] = (symbol_df['volume'] - symbol_df['prev_volume']) / (symbol_df['prev_volume'].replace(0, np.nan) + 1e-6)
-                symbol_df['high_low_range'] = (symbol_df['high'] - symbol_df['low']) / symbol_df['close'].replace(0, np.nan)
-                symbol_df['close_open_range'] = (symbol_df['close'] - symbol_df['open']) / symbol_df['close'].replace(0, np.nan)
+                # Avoid division by zero or very small numbers - reference from new_features
+                prev_close = new_features['prev_close']
+                prev_volume = new_features['prev_volume']
+                
+                new_features['price_change'] = (symbol_df['close'] - prev_close) / (prev_close.replace(0, np.nan) + 1e-6)
+                new_features['volume_change'] = (symbol_df['volume'] - prev_volume) / (prev_volume.replace(0, np.nan) + 1e-6)
+                new_features['high_low_range'] = (symbol_df['high'] - symbol_df['low']) / symbol_df['close'].replace(0, np.nan)
+                new_features['close_open_range'] = (symbol_df['close'] - symbol_df['open']) / symbol_df['close'].replace(0, np.nan)
+
+                # Market regime features
+                if 'nifty_corr_20d' in symbol_df.columns:
+                    # Correlation divergence (when stock moves differently from market)
+                    new_features['corr_change'] = symbol_df['nifty_corr_20d'] - symbol_df['nifty_corr_60d']
+                    # Market regime feature (high correlation is different regime than low correlation)
+                    new_features['market_regime'] = pd.cut(symbol_df['nifty_corr_20d'], 
+                                                    bins=[-1.1, -0.5, 0, 0.5, 1.1],
+                                                    labels=[0, 1, 2, 3])
+
+                # Seasonal effects
+                if 'day_of_week' in symbol_df.columns:
+                    # Convert categorical day of week to dummy variables if not already in is_weekday format
+                    if 'is_weekday_1' not in symbol_df.columns:
+                        for day in range(1, 6):  # 1 through 5 for weekdays
+                            new_features[f'is_day_{day}'] = (symbol_df['day_of_week'] == day).astype(int)
+                    
+                    # Month effect
+                    if 'month' in symbol_df.columns:
+                        # Create quarter dummy variables
+                        for q in range(1, 5):
+                            new_features[f'is_quarter_{q}'] = (symbol_df['quarter'] == q).astype(int)
+
+                # Volume pattern features
+                if 'volume_ratio_20d' in symbol_df.columns:
+                    # High volume breakout signal - use price_change from new_features
+                    new_features['high_volume_signal'] = ((symbol_df['volume_ratio_20d'] > 1.5) & 
+                                                    (new_features['price_change'] > 0)).astype(int)
+                    
+                    # Volume trend features
+                    if 'volume_roc_5d' in symbol_df.columns and 'volume_roc_10d' in symbol_df.columns:
+                        new_features['volume_trend'] = np.where(
+                            (symbol_df['volume_roc_5d'] > 0) & (symbol_df['volume_roc_10d'] > 0), 1,
+                            np.where((symbol_df['volume_roc_5d'] < 0) & (symbol_df['volume_roc_10d'] < 0), -1, 0)
+                        )
+
+                # Money flow confirmation
+                if 'cmf_20d' in symbol_df.columns:
+                    # Money flow confirmation of price trend - use price_change from new_features
+                    new_features['price_cmf_confirm'] = ((new_features['price_change'] > 0) & 
+                                                    (symbol_df['cmf_20d'] > 0)).astype(int)
                 
                 # 3. Target Variable
-                symbol_df['future_close'] = symbol_df['close'].shift(-prediction_horizon)
-                symbol_df['future_return'] = (symbol_df['future_close'] - symbol_df['close']) / symbol_df['close'].replace(0, np.nan)
-                symbol_df['target'] = np.where(symbol_df['future_return'] > threshold, 1, 0)
+                new_features['future_close'] = symbol_df['close'].shift(-prediction_horizon)
+                new_features['future_return'] = (new_features['future_close'] - symbol_df['close']) / symbol_df['close'].replace(0, np.nan)
+                new_features['target'] = np.where(new_features['future_return'] > threshold, 1, 0)
+                # Additional targets for more specific predictions
+                # Exit signal (when to sell)
+                new_features['exit_signal'] = np.where(new_features['future_return'] < -threshold, 1, 0)  
+
+                # Time to target - number of days to reach peak return within prediction horizon
+                def days_to_peak(row_idx, horizon, close_series):
+                    if row_idx + horizon >= len(close_series):
+                        return np.nan
+                    prices = close_series.iloc[row_idx:row_idx+horizon+1].values
+                    base_price = prices[0]
+                    returns = (prices - base_price) / base_price
+                    max_return_idx = np.argmax(returns)
+                    return max_return_idx if max_return_idx > 0 else np.nan
+
+                # Apply days to peak calculation
+                new_features['days_to_target'] = [days_to_peak(i, prediction_horizon, symbol_df['close']) 
+                                            for i in range(len(symbol_df))]
                 
-                # Remove inf values and NaNs
+                # Price pattern features
+                price_change_series = pd.Series(new_features['price_change'])
+                new_features['price_acceleration'] = price_change_series - price_change_series.shift(1)
+                
+                new_features['breakout'] = ((symbol_df['high'] > symbol_df['high'].rolling(20).max().shift(1)) & 
+                                        (symbol_df['volume'] > symbol_df['volume'].rolling(20).mean() * 1.5)).astype(int)
+
+                # Volatility features
+                new_features['atr_ratio'] = symbol_df['atr_14'] / symbol_df['close']
+                new_features['bollinger_width'] = (symbol_df['bollinger_upper'] - symbol_df['bollinger_lower']) / symbol_df['bollinger_middle']
+
+                # Support/resistance features
+                new_features['dist_to_upper_band'] = (symbol_df['bollinger_upper'] - symbol_df['close']) / symbol_df['close']
+                new_features['dist_to_lower_band'] = (symbol_df['close'] - symbol_df['bollinger_lower']) / symbol_df['close']
+                new_features['dist_to_sma200'] = (symbol_df['close'] - symbol_df['sma_200']) / symbol_df['close']
+
+                # Momentum divergence
+                new_features['price_rsi_divergence'] = ((symbol_df['close'] > symbol_df['close'].shift(5)) & 
+                                                    (symbol_df['rsi_14'] < symbol_df['rsi_14'].shift(5))).astype(int)
+                
+                # These are columns that exist in the database table but not in our new features
+                if 'vama_20d' in symbol_df.columns and 'vama_20d' not in new_features:
+                    new_features['vama_20d'] = symbol_df['vama_20d']
+
+                if 'vpci_20d' in symbol_df.columns and 'vpci_20d' not in new_features:
+                    new_features['vpci_20d'] = symbol_df['vpci_20d']
+
+                if 'volume_sma_50d' in symbol_df.columns and 'volume_sma_50d' not in new_features:
+                    new_features['volume_sma_50d'] = symbol_df['volume_sma_50d']
+
+                if 'nifty_corr_full' in symbol_df.columns and 'nifty_corr_full' not in new_features:
+                    new_features['nifty_corr_full'] = symbol_df['nifty_corr_full']
+
+                # Calendar year start/end indicators
+                # These might not be in the fetched data, so we'll calculate them
+                if 'is_year_start' not in new_features:
+                    if 'is_year_start' in symbol_df.columns:
+                        new_features['is_year_start'] = symbol_df['is_year_start']
+                    elif 'date' in symbol_df.columns:
+                        dates = pd.to_datetime(symbol_df['date'])
+                        new_features['is_year_start'] = ((dates.dt.month == 1) & (dates.dt.day == 1)).astype(int)
+
+                if 'is_year_end' not in new_features:
+                    if 'is_year_end' in symbol_df.columns:
+                        new_features['is_year_end'] = symbol_df['is_year_end']
+                    elif 'date' in symbol_df.columns:
+                        dates = pd.to_datetime(symbol_df['date'])
+                        new_features['is_year_end'] = ((dates.dt.month == 12) & (dates.dt.day == 31)).astype(int)
+
+                # Mean reversion potential
+                new_features['zscore_20d'] = (symbol_df['close'] - symbol_df['close'].rolling(20).mean()) / symbol_df['close'].rolling(20).std()
+
+                # Trend strength features
+                new_features['adx_trend_strength'] = np.where(symbol_df['adx_14'] > 25, 1, 0)
+                new_features['di_crossover'] = np.where(symbol_df['di_plus_14'] > symbol_df['di_minus_14'], 1, -1)
+
+                # Remove columns that aren't in the database table
+                if 'is_quarter_3' in result_df.columns:
+                    logger.info("Removing 'is_quarter_3' column as it's not in the database table")
+                    result_df = result_df.drop(columns=['is_quarter_3'])
+
+                # Historical performance during similar market conditions
+                new_features['return_ratio_20_5'] = symbol_df['return_20d'] / (symbol_df['return_5d'] + 1e-6)  # Momentum consistency
+                new_features['return_consistency'] = (symbol_df['return_5d'] > 0).rolling(10).mean()  # % of positive 5-day returns recently
+
+                # Relative performance
+                sector_columns = [col for col in symbol_df.columns if 'rs_nifty' in col]
+                if sector_columns:
+                    new_features['sector_strength'] = symbol_df[sector_columns].mean(axis=1)
+                
+                # Create a DataFrame from the new features
+                features_df = pd.DataFrame(new_features, index=symbol_df.index)
+                
+                # Combine with original data
+                symbol_df = pd.concat([symbol_df, features_df], axis=1)
+                
+                # Remove inf values
                 symbol_df = symbol_df.replace([np.inf, -np.inf], np.nan)
                 
-                # Drop rows with NaN in future_close (can't train without target)
-                symbol_df = symbol_df.dropna(subset=['future_close'])
+                # Clean newly created features with NaNs using similar approach
+                # These will mostly be in the lagged and derived features
+                new_feature_cols = list(new_features.keys())
+
+                if new_feature_cols:
+                    for col in new_feature_cols:
+                        if col in symbol_df.columns:
+                            # Check if the column has any non-NA values - convert to a boolean scalar first
+                            has_valid_values = symbol_df[col].notna().any()
+                            if isinstance(has_valid_values, bool) and has_valid_values:
+                                # For lag features, use next value in series (bfill)
+                                if 'lag' in col:
+                                    symbol_df[col] = symbol_df[col].bfill(limit=1)
+                                    symbol_df[col] = symbol_df[col].ffill(limit=1)
+                                    symbol_df[col] = symbol_df[col].fillna(0.0)
+                                # For price change features, use median or zero
+                                elif any(x in col for x in ['change', 'range']):
+                                    median_val = symbol_df[col].median()
+                                    symbol_df[col] = symbol_df[col].fillna(median_val if not pd.isna(median_val) else 0.0)
+                                else:
+                                    symbol_df[col] = symbol_df[col].fillna(0.0)
+                            else:
+                                # All values are NA, just fill with zeros
+                                symbol_df[col] = symbol_df[col].fillna(0.0)
                 
-                # Log the data quality for this symbol
-                logger.debug(f"Symbol {symbol}: Before NaN removal: {len(symbol_df)} rows")
-                nan_counts = symbol_df.isna().sum()
-                columns_with_nans = nan_counts[nan_counts > 0]
-                if not columns_with_nans.empty:
-                    logger.debug(f"Symbol {symbol}: Columns with NaNs: {columns_with_nans}")
+                # Drop rows with NaN in target variables - we can't train without valid targets
+                # This is the only place where we still need to drop rows
+                target_columns = ['future_close', 'future_return', 'target']
+                rows_before = len(symbol_df)
+                symbol_df = symbol_df.dropna(subset=target_columns)
+                rows_after = len(symbol_df)
                 
-                # Drop all rows with NaN values
-                symbol_df = symbol_df.dropna()
-                logger.debug(f"Symbol {symbol}: After NaN removal: {len(symbol_df)} rows")
+                if rows_before > rows_after:
+                    logger.debug(f"Removed {rows_before - rows_after} rows with NaN in target variables for {symbol}")
                 
                 if not symbol_df.empty:
                     all_processed_dfs.append(symbol_df)
@@ -268,6 +445,231 @@ class FeatureEngineering:
         logger.info(f"Final DataFrame shape: {result_df.shape}")
         
         return result_df
+    
+    def clean_data_for_ml(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prepare data for machine learning using an optimized approach for handling NaN values
+        in technical indicators based on their financial meaning.
+        
+        Args:
+            df: DataFrame containing technical indicators with potential NaN values
+            
+        Returns:
+            DataFrame with NaN values appropriately handled for ML
+        """
+        try:
+            # Count initial rows
+            initial_row_count = len(df)
+            if df.empty:
+                logger.warning("Empty DataFrame provided, nothing to clean")
+                return df
+            
+            # Make a copy to avoid SettingWithCopyWarning
+            df = df.copy()
+            
+            # Get list of all indicator columns (excluding date and trading_symbol)
+            indicator_columns = [col for col in df.columns 
+                                if col not in ['date', 'trading_symbol', 'id', 'open', 'high', 'low', 'close', 'volume']]
+            
+            # Calculate percentage of missing values by column before cleaning
+            missing_by_column = df[indicator_columns].isnull().mean() * 100
+            high_missing_cols = missing_by_column[missing_by_column > 25].index.tolist()
+            if high_missing_cols:
+                logger.warning(f"Columns with >25% missing values: {high_missing_cols}")
+            
+            # Group indicators by type for appropriate handling
+            trend_indicators = [col for col in df.columns if col.startswith(('sma_', 'ema_', 'bollinger_'))]
+
+            # 1. Calendar features - these should be kept as is, no cleaning needed as they're discrete values
+            calendar_indicators = ['day_of_week', 'day_of_month', 'month', 'quarter',
+                                'is_weekday_1', 'is_weekday_2', 'is_weekday_3', 'is_weekday_4', 'is_weekday_5',
+                                'is_month_start', 'is_month_end', 'is_quarter_start', 'is_quarter_end',
+                                'is_year_start', 'is_year_end']
+            
+            for col in calendar_indicators:
+                if col in df.columns and df[col].isnull().any():
+                    # For day_of_week, month, etc., use the most common value
+                    if col in ['day_of_week', 'day_of_month', 'month', 'quarter']:
+                        most_common = df[col].mode().iloc[0]
+                        df[col] = df[col].fillna(most_common)
+                    # For boolean flags, fill with 0 (False)
+                    else:
+                        df[col] = df[col].fillna(0)
+            
+            # 2. Correlation features
+            correlation_indicators = [col for col in df.columns if 'corr' in col]
+            for col in correlation_indicators:
+                if col in df.columns and df[col].isnull().any():
+                    # For correlation, 0 means no correlation
+                    df[col] = df[col].fillna(0.0)
+            
+            # 3. Relative strength indicators
+            rs_indicators = [col for col in df.columns if col.startswith('rs_')]
+            for col in rs_indicators:
+                if col in df.columns and df[col].isnull().any():
+                    # 1.0 means equal performance to the reference
+                    df[col] = df[col].fillna(1.0)
+
+            # 5. Money flow indicators
+            money_flow_indicators = ['cmf_20d', 'pvt', 'volume_oscillator', 'eom_14d', 'vama_20d', 'vpci_20d']
+            for col in money_flow_indicators:
+                if col in df.columns and df[col].isnull().any():
+                    # For money flow indicators, 0 is neutral
+                    df[col] = df[col].fillna(0.0)
+
+            momentum_oscillators = [
+                'rsi_14', 'stochastic_k', 'stochastic_d', 'macd_line', 'macd_signal', 
+                'macd_histogram', 'cci_20', 'mfi_14', 'williams_r', 'roc'
+            ]
+            
+            volatility_indicators = ['atr_14', 'natr', 'stddev', 'var']
+            
+            volume_indicators = [col for col in df.columns if 'volume' in col] + ['obv', 'ad_line', 'adosc']
+
+            # Handle the new volume metrics specifically
+            volume_metric_indicators = [col for col in df.columns if any(x in col for x in ['volume_sma_', 'volume_ratio_', 'volume_roc_'])]
+            for col in volume_metric_indicators:
+                if col in df.columns and df[col].isnull().any():
+                    if 'ratio' in col:
+                        # For volume ratios, 1.0 means normal volume
+                        df[col] = df[col].fillna(1.0)
+                    elif 'roc' in col:
+                        # For rate of change, 0 means no change
+                        df[col] = df[col].fillna(0.0)
+                    else:
+                        # For other volume metrics, use median
+                        median_val = df[col].median()
+                        df[col] = df[col].fillna(median_val if not pd.isna(median_val) else 0.0)
+            
+            directional_indicators = ['adx_14', 'di_plus_14', 'di_minus_14']
+            
+            correlation_indicators = [col for col in df.columns if 'corr' in col]
+            
+            relative_strength_indicators = [col for col in df.columns if col.startswith('rs_')]
+            
+            return_indicators = [col for col in df.columns if col.startswith('return_')]
+            
+            # Filter for indicators that actually exist in the dataframe
+            all_indicator_groups = {
+                'trend': [col for col in trend_indicators if col in df.columns],
+                'momentum': [col for col in momentum_oscillators if col in df.columns],
+                'volatility': [col for col in volatility_indicators if col in df.columns],
+                'volume': [col for col in volume_indicators if col in df.columns],
+                'directional': [col for col in directional_indicators if col in df.columns],
+                'correlation': [col for col in correlation_indicators if col in df.columns],
+                'relative_strength': [col for col in relative_strength_indicators if col in df.columns],
+                'returns': [col for col in return_indicators if col in df.columns]
+            }
+            
+            # Apply appropriate NaN handling strategies by indicator type
+            
+            # 1. Trend indicators: Forward fill (continues the trend)
+            for col in all_indicator_groups['trend']:
+                if col in df.columns and df[col].isnull().any():
+                    # Forward fill with limit to avoid extending too far
+                    df[col] = df[col].ffill(limit=5)
+                    # If any NaNs remain at the beginning of the series, backward fill
+                    df[col] = df[col].bfill(limit=5)
+                    # Any remaining NaNs get the column median
+                    if df[col].isnull().any():
+                        df[col] = df[col].fillna(df[col].median() if not pd.isna(df[col].median()) else 0.0)
+            
+            # 2. Momentum oscillators: Fill with neutral values
+            for col in all_indicator_groups['momentum']:
+                if col in df.columns and df[col].isnull().any():
+                    if col == 'rsi_14':
+                        df[col] = df[col].fillna(50.0)  # Neutral RSI
+                    elif col in ['stochastic_k', 'stochastic_d']:
+                        df[col] = df[col].fillna(50.0)  # Neutral stochastic
+                    elif col in ['macd_line', 'macd_signal', 'macd_histogram']:
+                        df[col] = df[col].fillna(0.0)  # Neutral MACD
+                    elif col == 'cci_20':
+                        df[col] = df[col].fillna(0.0)  # Neutral CCI
+                    elif col == 'williams_r':
+                        df[col] = df[col].fillna(-50.0)  # Neutral Williams %R
+                    else:
+                        df[col] = df[col].fillna(0.0)  # Default neutral value
+            
+            # 3. Volatility indicators: Fill with median for the series
+            for col in all_indicator_groups['volatility']:
+                if col in df.columns and df[col].isnull().any():
+                    df[col] = df[col].fillna(df[col].median() if not pd.isna(df[col].median()) else 0.0)
+            
+            # 4. Volume indicators: Fill with median or zero depending on indicator
+            for col in all_indicator_groups['volume']:
+                if col in df.columns and df[col].isnull().any():
+                    if 'ratio' in col or col.endswith('_sma'):
+                        df[col] = df[col].fillna(1.0)  # Neutral volume ratio
+                    else:
+                        df[col] = df[col].fillna(0.0)  # Neutral for other volume indicators
+            
+            # 5. Directional indicators: Fill with neutral values
+            for col in all_indicator_groups['directional']:
+                if col in df.columns and df[col].isnull().any():
+                    if col == 'adx_14':
+                        df[col] = df[col].fillna(25.0)  # Weak trend strength
+                    else:
+                        df[col] = df[col].fillna(25.0)  # Neutral directional indicator
+            
+            # 6. Correlation indicators: Fill with zero (no correlation)
+            for col in all_indicator_groups['correlation']:
+                if col in df.columns and df[col].isnull().any():
+                    df[col] = df[col].fillna(0.0)  # No correlation
+            
+            # 7. Relative strength indicators: Fill with one (equal performance)
+            for col in all_indicator_groups['relative_strength']:
+                if col in df.columns and df[col].isnull().any():
+                    df[col] = df[col].fillna(1.0)  # Equal relative performance
+            
+            # 8. Return indicators: Special handling - more complex
+            for col in all_indicator_groups['returns']:
+                if col in df.columns and df[col].isnull().any():
+                    # For returns, we'll use forward and backward fill with smaller limits 
+                    # then fall back to zero (no change)
+                    df[col] = df[col].ffill(limit=3)
+                    df[col] = df[col].bfill(limit=3)
+                    df[col] = df[col].fillna(0.0)  # No change
+            # Add to the clean_data_for_ml method
+            pattern_indicators = [col for col in df.columns if any(x in col for x in ['breakout', 'divergence', 'crossover'])]
+
+            if pattern_indicators:
+                for col in pattern_indicators:
+                    if col in df.columns and df[col].isnull().any():
+                        df[col] = df[col].fillna(0)  # For pattern indicators, no pattern is the default
+            
+            # Handle any remaining columns with NaN values
+            remaining_cols = [col for col in indicator_columns 
+                            if col in df.columns and df[col].isnull().any()]
+            
+            if remaining_cols:
+                logger.warning(f"Handling {len(remaining_cols)} remaining columns with NaNs")
+                for col in remaining_cols:
+                    # Use column median if available, otherwise zero
+                    median_val = df[col].median()
+                    fill_value = median_val if not pd.isna(median_val) else 0.0
+                    df[col] = df[col].fillna(fill_value)
+            
+            # Check for any remaining NaN values
+            remaining_nulls = df[indicator_columns].isnull().sum().sum()
+            if remaining_nulls > 0:
+                # Find columns with remaining NaN values
+                cols_with_nulls = df[indicator_columns].columns[df[indicator_columns].isnull().any()].tolist()
+                logger.warning(f"Warning: {remaining_nulls} NaN values remain in columns: {cols_with_nulls}")
+                
+                # Final fallback: fill any remaining NaNs with zeros
+                for col in cols_with_nulls:
+                    df[col] = df[col].fillna(0.0)
+            
+            # Log the results
+            removed_nans = initial_row_count * len(indicator_columns) - df[indicator_columns].isnull().sum().sum()
+            logger.info(f"Cleaned {removed_nans} NaN values while preserving {len(df)} rows")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error in clean_data_for_ml: {e}", exc_info=True)
+            # In case of error, return the original DataFrame
+            return df
 
     def get_trading_symbols(self, start_date: str, end_date: Union[str, date]) -> List[str]:
         """
@@ -361,7 +763,11 @@ class FeatureEngineering:
             
             # Ensure all numeric columns are float
             numeric_cols = df_filtered.select_dtypes(include=np.number).columns
-            df_filtered[numeric_cols] = df_filtered[numeric_cols].astype(float)
+            # First ensure all columns exist in the DataFrame
+            valid_numeric_cols = [col for col in numeric_cols if col in df_filtered.columns]
+            # Then perform the conversion
+            if valid_numeric_cols:
+                df_filtered[valid_numeric_cols] = df_filtered[valid_numeric_cols].astype(float)
             
             # Replace any remaining NaN/inf values
             df_filtered = df_filtered.replace([np.inf, -np.inf], np.nan)
@@ -660,8 +1066,8 @@ def main():
     logger.info(f"Data fetched: {df.shape[0]} rows, {df.shape[1]} columns")
     
     # Create features
-    logger.info("Creating features...")
-    df_featured = feature_engineer.create_features(df)
+    logger.info("Creating features with optimized NaN handling...")
+    df_featured = feature_engineer.create_features(df, lag_days=[1, 2, 3, 5, 10, 15, 20])
     
     if not df_featured.empty:
         # Display feature stats

@@ -58,7 +58,7 @@ class FeatureEngineering:
             cursor = conn.cursor(dictionary=True)
 
             # Process in batches to avoid memory issues
-            batch_size = 100  # Process 50 symbols at a time
+            batch_size = 75  # Process 50 symbols at a time
             all_data = []
             
             for i in range(0, len(trading_symbols), batch_size):
@@ -333,17 +333,17 @@ class FeatureEngineering:
                                                     (symbol_df['rsi_14'] < symbol_df['rsi_14'].shift(5))).astype(int)
                 
                 # These are columns that exist in the database table but not in our new features
-                if 'vama_20d' in symbol_df.columns and 'vama_20d' not in new_features:
-                    new_features['vama_20d'] = symbol_df['vama_20d']
+                # if 'vama_20d' in symbol_df.columns and 'vama_20d' not in new_features:
+                #     new_features['vama_20d'] = symbol_df['vama_20d']
 
-                if 'vpci_20d' in symbol_df.columns and 'vpci_20d' not in new_features:
-                    new_features['vpci_20d'] = symbol_df['vpci_20d']
+                # if 'vpci_20d' in symbol_df.columns and 'vpci_20d' not in new_features:
+                #     new_features['vpci_20d'] = symbol_df['vpci_20d']
 
-                if 'volume_sma_50d' in symbol_df.columns and 'volume_sma_50d' not in new_features:
-                    new_features['volume_sma_50d'] = symbol_df['volume_sma_50d']
+                # if 'volume_sma_50d' in symbol_df.columns and 'volume_sma_50d' not in new_features:
+                #     new_features['volume_sma_50d'] = symbol_df['volume_sma_50d']
 
-                if 'nifty_corr_full' in symbol_df.columns and 'nifty_corr_full' not in new_features:
-                    new_features['nifty_corr_full'] = symbol_df['nifty_corr_full']
+                # if 'nifty_corr_full' in symbol_df.columns and 'nifty_corr_full' not in new_features:
+                #     new_features['nifty_corr_full'] = symbol_df['nifty_corr_full']
 
                 # Calendar year start/end indicators
                 # These might not be in the fetched data, so we'll calculate them
@@ -706,7 +706,7 @@ class FeatureEngineering:
                 conn.close()
             return []
 
-    def store_features(self, df: pd.DataFrame, table_name: str = 'ml_features', batch_size: int = 1000) -> bool:
+    def store_features(self, df: pd.DataFrame, table_name: str = 'ml_features', batch_size: int = 2000) -> bool:
         """
         Stores the generated features in a MySQL table.
         
@@ -730,9 +730,15 @@ class FeatureEngineering:
             cursor.execute(f"SHOW COLUMNS FROM {table_name}")
             table_columns = [row[0] for row in cursor.fetchall()]
             
-            logger.info(f"Table columns: {len(table_columns)}, DataFrame columns: {len(df.columns)}")
+            # CRITICAL FIX: Check for and remove duplicate columns in the DataFrame
+            duplicate_cols = df.columns[df.columns.duplicated()].tolist()
+            if duplicate_cols:
+                logger.warning(f"Found duplicate columns in DataFrame: {duplicate_cols}")
+                # Keep only the first occurrence of each column
+                df = df.loc[:, ~df.columns.duplicated(keep='first')]
+                logger.info(f"Removed duplicate columns. New shape: {df.shape}")
             
-            # Filter dataframe to include only columns that exist in the table
+            # Get column sets for easier comparison
             df_columns = set(df.columns)
             table_columns_set = set(table_columns)
             
@@ -741,33 +747,27 @@ class FeatureEngineering:
             if missing_in_table:
                 logger.warning(f"Columns in DataFrame but not in table: {missing_in_table}")
             
-            # Find columns in table but not in DataFrame
-            missing_in_df = table_columns_set - df_columns
-            if missing_in_df:
-                logger.warning(f"Columns in table but not in DataFrame: {missing_in_df}")
-            
             # Get common columns
             common_columns = list(df_columns.intersection(table_columns_set))
-            
-            # Ensure we have at least some common columns
-            if not common_columns:
-                logger.error("No common columns between DataFrame and table")
-                cursor.close()
-                conn.close()
-                return False
-                
-            logger.info(f"Using {len(common_columns)} common columns for insertion")
             
             # Create filtered DataFrame with only common columns
             df_filtered = df[common_columns].copy()
             
             # Ensure all numeric columns are float
+            # Ensure all numeric columns are float
             numeric_cols = df_filtered.select_dtypes(include=np.number).columns
-            # First ensure all columns exist in the DataFrame
-            valid_numeric_cols = [col for col in numeric_cols if col in df_filtered.columns]
-            # Then perform the conversion
-            if valid_numeric_cols:
-                df_filtered[valid_numeric_cols] = df_filtered[valid_numeric_cols].astype(float)
+            logger.info(f"Converting {len(numeric_cols)} numeric columns to float")
+
+            # Convert each column individually
+            for col in numeric_cols:
+                if col in df_filtered.columns:
+                    try:
+                        # Convert one column at a time
+                        df_filtered[col] = df_filtered[col].astype(float)
+                    except Exception as e:
+                        logger.error(f"Error converting column {col} to float: {e}")
+                        # If conversion fails, set to 0.0
+                        df_filtered[col] = 0.0
             
             # Replace any remaining NaN/inf values
             df_filtered = df_filtered.replace([np.inf, -np.inf], np.nan)
@@ -816,7 +816,19 @@ class FeatureEngineering:
                 
                 # Convert DataFrame to list of tuples for MySQL executemany
                 # This is more efficient than iterating through rows
-                data = list(batch_df.itertuples(index=False, name=None))
+                data = [tuple(row) for _, row in batch_df[common_columns].iterrows()]
+
+                # Add this before cursor.executemany
+                if len(data) > 0:
+                    # Check length of first row against expected placeholder count
+                    logger.info(f"SQL placeholders: {len(common_columns)}, First row data length: {len(data[0])}")
+                    
+                    # If lengths don't match, that's the problem!
+                    if len(common_columns) != len(data[0]):
+                        logger.error(f"MISMATCH! Common columns count ({len(common_columns)}) != Data tuple length ({len(data[0])})")
+                        # Log the columns and data to compare
+                        logger.error(f"Common columns: {common_columns}")
+                        logger.error(f"First row keys: {batch_df[common_columns].columns.tolist()}")
                 
                 try:
                     cursor.executemany(insert_query, data)
@@ -829,13 +841,16 @@ class FeatureEngineering:
                     # Try row by row if batch insert fails
                     if len(batch_df) > 1:
                         logger.info("Trying row-by-row insertion for problematic batch")
-                        for j, row in batch_df.iterrows():
+                        # FIXED: Only iterate through common columns
+                        for j, row in batch_df[common_columns].iterrows():
                             try:
-                                cursor.execute(insert_query, tuple(row))
+                                # Pass the row values as a tuple
+                                values = tuple(row)
+                                cursor.execute(insert_query, values)
                                 conn.commit()
                                 rows_inserted += 1
                             except Exception as row_error:
-                                logger.error(f"Error inserting row {j}: {row_error}")
+                                # logger.error(f"Error inserting row {j}: {row_error}")
                                 conn.rollback()
 
             logger.info(f"Successfully stored {rows_inserted}/{total_rows} rows in {table_name}")

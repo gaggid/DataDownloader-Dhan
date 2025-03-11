@@ -1,0 +1,13 @@
+Metric,Value
+total_trades,21.0
+winning_trades,7.0
+losing_trades,14.0
+win_rate,0.3333333333333333
+total_profit,1461.5000000000007
+total_loss,-1790.1799999999998
+net_profit,-328.67999999999915
+profit_factor,0.8163983510038101
+avg_return_pct,-1.5156167125118924
+return_std,5.577636059049649
+final_equity,99671.32
+total_return_pct,-0.3286799999999923

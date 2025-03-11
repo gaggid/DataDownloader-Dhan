@@ -1,0 +1,17 @@
+feature
+parkinson_vol_10d
+parkinson_vol_20d
+parkinson_vol_5d
+price_range_pct
+body_size_pct
+vol_regime_10d
+min_low_15d
+adx
+rel_return_30d
+rel_return_20d
+volume_ratio_20d
+close_position
+rel_return_1d
+rel_return_15d
+rel_return_10d
+volume_ratio_10d

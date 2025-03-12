@@ -39,7 +39,8 @@ logger = logging.getLogger(__name__)
 
 class StockPredictionFramework:
     def __init__(self, db_password, prediction_horizon_days=[1, 3, 5, 7, 10], 
-                upside_threshold_min=0.01, upside_threshold_max=0.03, 
+                upside_threshold_min=0.01, upside_threshold_max=0.03,
+                downside_threshold_min=0.01, downside_threshold_max=0.03,
                 use_pytorch=True, primary_horizon=7):
         """
         Initialize the stock prediction framework
@@ -47,8 +48,10 @@ class StockPredictionFramework:
         Args:
             db_password: Password for database connection
             prediction_horizon_days: List of days for prediction horizons
-            upside_threshold_min: Minimum price movement threshold (1%)
-            upside_threshold_max: Maximum price movement threshold (3%)
+            upside_threshold_min: Minimum price movement threshold for long (1%)
+            upside_threshold_max: Maximum price movement threshold for long (3%)
+            downside_threshold_min: Minimum price movement threshold for short (1%)
+            downside_threshold_max: Maximum price movement threshold for short (3%)
             use_pytorch: Whether to use PyTorch models
             primary_horizon: The primary prediction horizon to focus on
         """
@@ -56,6 +59,8 @@ class StockPredictionFramework:
         self.prediction_horizon_days = prediction_horizon_days
         self.upside_threshold_min = upside_threshold_min
         self.upside_threshold_max = upside_threshold_max
+        self.downside_threshold_min = downside_threshold_min
+        self.downside_threshold_max = downside_threshold_max
         self.use_pytorch = use_pytorch
         self.primary_horizon = primary_horizon
         self.optimal_thresholds = {}
@@ -679,7 +684,7 @@ class StockPredictionFramework:
             
             # Prepare target variables dictionary
             target_columns = {}
-            
+
             # Generate target variables for each prediction horizon
             for days in self.prediction_horizon_days:
                 # Future return
@@ -688,24 +693,34 @@ class StockPredictionFramework:
                 # Future price
                 target_columns[f'future_price_{days}d'] = stock_df['close'].shift(-days)
                 
-                # Target: 1 if future return is between thresholds, 0 otherwise
-                target_col = f'target_{days}d'
-                target = pd.Series(0, index=stock_df.index)
-                mask = (target_columns[f'future_return_{days}d'] >= self.upside_threshold_min)
-                target.loc[mask] = 1
-                target_columns[target_col] = target
+                # Target Long: 1 if future return is above upside threshold, 0 otherwise
+                target_col_long = f'target_long_{days}d'
+                target_long = pd.Series(0, index=stock_df.index)
+                mask_long = (target_columns[f'future_return_{days}d'] >= self.upside_threshold_min)
+                target_long.loc[mask_long] = 1
+                target_columns[target_col_long] = target_long
+
+                # Target Short: 1 if future return is below downside threshold, 0 otherwise
+                target_col_short = f'target_short_{days}d'
+                target_short = pd.Series(0, index=stock_df.index)
+                mask_short = (target_columns[f'future_return_{days}d'] <= -self.downside_threshold_min)
+                target_short.loc[mask_short] = 1
+                target_columns[target_col_short] = target_short
 
                 # Log class distribution for monitoring
-                positive_count = target.sum()
-                total_count = len(target)
-                positive_pct = positive_count / total_count * 100
-                logger.info(f"Target {days}d - Positive cases: {positive_count}/{total_count} ({positive_pct:.2f}%)")
+                positive_long = target_long.sum()
+                positive_short = target_short.sum()
+                total_count = len(target_long)
+                logger.info(f"Target {days}d - Long cases: {positive_long}/{total_count} ({positive_long/total_count*100:.2f}%)")
+                logger.info(f"Target {days}d - Short cases: {positive_short}/{total_count} ({positive_short/total_count*100:.2f}%)")
                 
                 # Days to target (filled when backtesting)
-                target_columns[f'days_to_target_{days}d'] = pd.Series(np.nan, index=stock_df.index)
+                target_columns[f'days_to_long_target_{days}d'] = pd.Series(np.nan, index=stock_df.index)
+                target_columns[f'days_to_short_target_{days}d'] = pd.Series(np.nan, index=stock_df.index)
                 
-                # Target price
-                target_columns[f'target_price_{days}d'] = stock_df['close'] * (1 + self.upside_threshold_min)
+                # Target prices
+                target_columns[f'target_long_price_{days}d'] = stock_df['close'] * (1 + self.upside_threshold_min)
+                target_columns[f'target_short_price_{days}d'] = stock_df['close'] * (1 - self.downside_threshold_min)
             
             # Add all feature columns to stock_df at once
             stock_df = pd.concat([stock_df, pd.DataFrame(new_columns, index=stock_df.index)], axis=1)
@@ -852,22 +867,28 @@ class StockPredictionFramework:
         return best_threshold
         
         
-    def analyze_features(self, df, target_days=5, correlation_threshold=0.05, horizon_specific=True):
+    def analyze_features(self, df, target_days=5, target_col=None, correlation_threshold=0.05, horizon_specific=True):
         """
         Analyze and select the most important features for prediction - optimized for different horizons
         
         Args:
             df: DataFrame with engineered features
             target_days: Target prediction horizon
+            target_col: Target column name (for long/short differentiation)
             correlation_threshold: Minimum correlation to consider a feature important
             horizon_specific: Whether to use horizon-specific feature selection strategies
                 
         Returns:
             List of selected feature names
         """
-        logger.info(f"Analyzing features for {target_days}-day prediction horizon")
+        # Determine direction from target column
+        direction = 'long'
+        if target_col is not None and 'short' in target_col:
+            direction = 'short'
+        elif target_col is None:
+            target_col = f'target_{direction}_{target_days}d'
         
-        target_col = f'target_{target_days}d'
+        logger.info(f"Analyzing features for {direction} {target_days}-day prediction horizon")
         
         # Sample data to reduce memory usage if dataset is large
         if len(df) > 100000:
@@ -912,7 +933,7 @@ class StockPredictionFramework:
         
         # Save all feature correlations to CSV
         correlation_df = pd.DataFrame({'feature': correlations.index, 'correlation': correlations.values})
-        correlation_csv_path = f'{self.results_dir}/feature_correlations_{target_days}d.csv'
+        correlation_csv_path = f'{self.results_dir}/feature_correlations_{direction}_{target_days}d.csv'
         correlation_df.to_csv(correlation_csv_path, index=False)
         logger.info(f"Saved feature correlations to {correlation_csv_path}")
         
@@ -1068,12 +1089,13 @@ class StockPredictionFramework:
             
             logger.info(f"Selected top {k} features using SelectKBest")
         
-        # Store selected features
-        self.selected_features[target_days] = final_features
+        # Store selected features with direction info
+        feature_key = f'{direction}_{target_days}d'
+        self.selected_features[feature_key] = final_features
         
         # Save final selected features to CSV
         selected_df = pd.DataFrame({'feature': final_features})
-        selected_csv_path = f'{self.results_dir}/selected_features_{target_days}d.csv'
+        selected_csv_path = f'{self.results_dir}/selected_features_{direction}_{target_days}d.csv'
         selected_df.to_csv(selected_csv_path, index=False)
         logger.info(f"Saved final selected features to {selected_csv_path}")
         
@@ -1081,28 +1103,44 @@ class StockPredictionFramework:
         if len(filtered_corr) > 0:
             plt.figure(figsize=(12, 8))
             filtered_corr.sort_values().plot(kind='barh')
-            plt.title(f'Feature Correlations with {target_days}-day Target')
+            plt.title(f'Feature Correlations with {direction} {target_days}-day Target')
             plt.tight_layout()
-            plt.savefig(f'{self.results_dir}/feature_importance_{target_days}d.png')
+            plt.savefig(f'{self.results_dir}/feature_importance_{direction}_{target_days}d.png')
             plt.close()
-        
-        # Clean up
-        df_clean = None
-        gc.collect()
         
         return final_features
             
-    def prepare_data_for_training(self, df, target_days=5, test_size=0.2, val_size=0.2):
+    def prepare_data_for_training(self, df, target_days=5, target_col=None, test_size=0.2, val_size=0.2):
         """
         Prepare data for model training including normalization
-        """
-        logger.info(f"Preparing data for {target_days}-day prediction horizon")
         
-        target_col = f'target_{target_days}d'
-        features = self.selected_features.get(target_days, [])
+        Args:
+            df: DataFrame with features
+            target_days: Target prediction horizon
+            target_col: Target column name (for long/short differentiation)
+            test_size: Proportion of data for testing
+            val_size: Proportion of training data for validation
+            
+        Returns:
+            Dictionary with prepared data
+        """
+        logger.info(f"Preparing data for {target_days}-day prediction")
+        
+        # If target_col not specified, use default naming
+        if target_col is None:
+            target_col = f'target_{target_days}d'
+        
+        # Determine direction from target column
+        direction = 'long'
+        if 'short' in target_col:
+            direction = 'short'
+        
+        # Get features for this direction and horizon
+        feature_key = f'{direction}_{target_days}d'
+        features = self.selected_features.get(feature_key, [])
         
         if not features:
-            logger.error("No features selected. Run analyze_features first.")
+            logger.error(f"No features selected for {direction} {target_days}-day horizon")
             return None
             
         # Drop rows with NaN
@@ -1113,8 +1151,7 @@ class StockPredictionFramework:
         df_clean = df_clean.sort_values('date')
         
         # Define cutoff dates for train/val/test
-        # First get the unique dates, then sort them
-        dates = df_clean['date'].unique()  # This line was missing in your update
+        dates = df_clean['date'].unique()
         dates = np.sort(dates)
         
         test_cutoff = int(len(dates) * (1 - test_size))
@@ -1147,12 +1184,10 @@ class StockPredictionFramework:
         X_val_scaled = scaler.transform(X_val)
         X_test_scaled = scaler.transform(X_test)
         
-        # Save the scaler
-        self.scalers[target_days] = scaler
-
-        scaler_path = f'{self.models_dir}/scaler_{target_days}d.pkl'
+        # Save the scaler with direction info
+        scaler_path = f'{self.models_dir}/scaler_{direction}_{target_days}d.pkl'
         joblib.dump(scaler, scaler_path)
-        logger.info(f"Saved scaler for {target_days}-day horizon to {scaler_path}")
+        logger.info(f"Saved scaler for {direction} {target_days}-day horizon to {scaler_path}")
         
         # Convert to numpy arrays
         data = {
@@ -1166,67 +1201,210 @@ class StockPredictionFramework:
             'train_df': train_df,
             'val_df': val_df,
             'test_df': test_df,
-            'scaler': scaler
+            'scaler': scaler,
+            'direction': direction
         }
-       
+    
         return data
     
-    def optimize_lightgbm(self, data, target_days, n_trials=30):
-        """
-        Optimize LightGBM hyperparameters using Optuna
+    def get_default_params(self, total_samples, positive_samples, n_features):
+        """Generate conservative default parameters based on data characteristics"""
+        class_ratio = positive_samples / total_samples
         
-        Args:
-            data: Dictionary with prepared data
-            target_days: Target prediction horizon
-            n_trials: Number of optimization trials
-            
-        Returns:
-            Best parameters
+        # Safe min_child_samples based on minority class
+        min_samples = max(5, int(positive_samples * 0.05))
+        
+        # Safe max_depth and num_leaves based on data size
+        if total_samples < 1000:
+            max_depth = 3
+            num_leaves = 7  # 2^3 - 1
+        elif total_samples < 10000:
+            max_depth = 5
+            num_leaves = 15  # Fewer than 2^5 - 1 to be conservative
+        else:
+            max_depth = 6
+            num_leaves = 31  # 2^6 - 1
+        
+        # Safe regularization based on number of features
+        if n_features < 10:
+            reg_alpha = 0.01
+            reg_lambda = 0.01
+        elif n_features < 50:
+            reg_alpha = 0.05
+            reg_lambda = 0.05
+        else:
+            reg_alpha = 0.1
+            reg_lambda = 0.1
+        
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'verbosity': -1,
+            'device': 'cpu',
+            'boosting_type': 'gbdt',
+            'learning_rate': 0.05,
+            'n_estimators': 100,
+            'max_depth': max_depth,
+            'num_leaves': num_leaves,
+            'min_child_samples': min_samples,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'reg_alpha': reg_alpha,
+            'reg_lambda': reg_lambda,
+        }
+        
+        # Handle class imbalance
+        if class_ratio < 0.05 or class_ratio > 0.95:
+            params['is_unbalance'] = True
+        elif class_ratio < 0.2 or class_ratio > 0.8:
+            if class_ratio < 0.5:
+                params['scale_pos_weight'] = (1 - class_ratio) / class_ratio
+            else:
+                params['scale_pos_weight'] = class_ratio / (1 - class_ratio)
+        
+        return params
+    
+    def optimize_lightgbm(self, data, target_days, direction="long", n_trials=30):
         """
-        logger.info(f"Optimizing LightGBM for {target_days}-day prediction with {n_trials} trials")
+        Optimize LightGBM hyperparameters using Optuna with data-aware constraints
+        """
+        logger.info(f"Optimizing LightGBM for {direction} {target_days}-day prediction with {n_trials} trials")
         
         X_train, y_train = data['X_train'], data['y_train']
         X_val, y_val = data['X_val'], data['y_val']
         
+        # Analyze class balance
+        positive_samples = np.sum(y_train == 1)
+        total_samples = len(y_train)
+        class_ratio = positive_samples / total_samples
+        
+        logger.info(f"Class distribution - Positive: {positive_samples}/{total_samples} ({class_ratio:.2%})")
+        
+        # Analyze feature characteristics
+        n_features = X_train.shape[1]
+        
+        # Calculate parameter ranges based on data characteristics
+        # Ensure min_child_samples has a reasonable range - never larger than 5% of data
+        min_samples_min = max(5, min(20, int(positive_samples * 0.01)))
+        min_samples_max = max(min_samples_min + 5, min(50, int(total_samples * 0.05)))
+        
+        # Ensure num_leaves has a reasonable range
+        max_num_leaves = min(127, total_samples // 20)  # At least 20 samples per leaf on average
+        
         def objective(trial):
+            # Calculate safe max_depth based on data size
+            # This ensures we don't create too many nodes for small datasets
+            safe_max_depth = min(8, max(3, int(np.log2(total_samples / min_samples_min))))
+            
+            # Calculate safe num_leaves range based on max_depth
+            current_max_depth = trial.suggest_int('max_depth', 3, safe_max_depth)
+            min_leaves = min(10, 2**current_max_depth - 1)
+            safe_max_leaves = min(2**current_max_depth - 1, max_num_leaves)
+            
+            # Ensure safe_max_leaves is greater than min_leaves
+            if safe_max_leaves <= min_leaves:
+                safe_max_leaves = min_leaves + 1
+            
+            # Define parameters with constraints that respect data characteristics
             param = {
                 'objective': 'binary',
                 'metric': 'auc',
                 'verbosity': -1,
-                'device': 'gpu',  # Add this line to use GPU
+                'device': 'cpu',  # Explicitly set to CPU to avoid potential GPU issues
                 'boosting_type': 'gbdt',
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
-                'max_depth': trial.suggest_int('max_depth', 3, 10),
-                'num_leaves': trial.suggest_int('num_leaves', 10, 100),
-                'min_child_samples': trial.suggest_int('min_child_samples', 5, 50),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
+                'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+                'max_depth': current_max_depth,
+                'num_leaves': trial.suggest_int('num_leaves', min_leaves, safe_max_leaves),
+                'min_child_samples': trial.suggest_int('min_child_samples', min_samples_min, min_samples_max),
                 'subsample': trial.suggest_float('subsample', 0.6, 1.0),
                 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
-                'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0)
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 1.0),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 1.0),
             }
             
-            gbm = lgb.LGBMClassifier(**param)
-            # Use callbacks instead of early_stopping_rounds
-            gbm.fit(
-                X_train, y_train,
-                eval_set=[(X_val, y_val)],
-                eval_metric='auc',
-                callbacks=[lgb.early_stopping(50, verbose=False)]  # Replace early_stopping_rounds
-            )
+            # Handle class imbalance differently based on severity
+            if class_ratio < 0.05 or class_ratio > 0.95:
+                # Severe imbalance: use is_unbalance
+                param['is_unbalance'] = True
+            elif class_ratio < 0.2 or class_ratio > 0.8:
+                # Moderate imbalance: use scale_pos_weight
+                if class_ratio < 0.5:
+                    param['scale_pos_weight'] = (1 - class_ratio) / class_ratio
+                else:
+                    param['scale_pos_weight'] = class_ratio / (1 - class_ratio)
             
-            y_pred_proba = gbm.predict_proba(X_val)[:, 1]
-            auc_score = roc_auc_score(y_val, y_pred_proba)
-            
-            return auc_score
+            try:
+                gbm = lgb.LGBMClassifier(**param)
+                
+                gbm.fit(
+                    X_train, y_train,
+                    eval_set=[(X_val, y_val)],
+                    eval_metric='auc',
+                    callbacks=[lgb.early_stopping(20, verbose=False)]
+                )
+                
+                y_pred_proba = gbm.predict_proba(X_val)[:, 1]
+                auc_score = roc_auc_score(y_val, y_pred_proba)
+                
+                return auc_score
+                
+            except Exception as e:
+                logger.warning(f"Trial failed with parameters: {param}")
+                logger.warning(f"Error message: {str(e)}")
+                
+                # Instead of just returning a low value, we can help Optuna learn from failures
+                # Check which parameters might be causing issues
+                if 'num_leaves' in str(e) or 'min_child_samples' in str(e) or 'left_count' in str(e):
+                    # Error related to tree structure - likely from aggressive parameter values
+                    return 0.1
+                
+                # Generic failure - give a very low score
+                return 0.0
         
-        study = optuna.create_study(direction='maximize')
-        study.optimize(objective, n_trials=n_trials)
+        # Use TPESampler with multivariate=True for better parameter exploration
+        sampler = optuna.samplers.TPESampler(seed=42, multivariate=True)
+        study = optuna.create_study(direction='maximize', sampler=sampler)
+        
+        try:
+            study.optimize(objective, n_trials=n_trials)
+        except Exception as e:
+            logger.error(f"Optimization failed: {str(e)}")
+            # Return conservative default parameters based on data characteristics
+            return self.get_default_params(total_samples, positive_samples, n_features)
+        
+        # Check if we got any successful trials
+        if len(study.trials) == 0 or study.best_value <= 0.1:
+            logger.warning("No successful trials. Using data-aware default parameters.")
+            return self.get_default_params(total_samples, positive_samples, n_features)
         
         logger.info(f"Best trial: score {study.best_value}, params {study.best_params}")
-        return study.best_params
         
-    def train_lightgbm_model(self, data, target_days, params=None):
+        # Build complete parameter dict with additional fixed parameters
+        best_params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'verbosity': -1,
+            'boosting_type': 'gbdt',
+            'device': 'cpu',
+        }
+        
+        # Handle class imbalance in the best parameters
+        if class_ratio < 0.05 or class_ratio > 0.95:
+            best_params['is_unbalance'] = True
+        elif class_ratio < 0.2 or class_ratio > 0.8:
+            if class_ratio < 0.5:
+                best_params['scale_pos_weight'] = (1 - class_ratio) / class_ratio
+            else:
+                best_params['scale_pos_weight'] = class_ratio / (1 - class_ratio)
+        
+        best_params.update(study.best_params)
+        
+        return best_params
+    
+
+        
+    def train_lightgbm_model(self, data, target_days=5, params=None):
         """
         Train LightGBM model for stock prediction
         
@@ -1238,7 +1416,8 @@ class StockPredictionFramework:
         Returns:
             Trained model
         """
-        logger.info(f"Training LightGBM model for {target_days}-day prediction")
+        direction = data.get('direction', 'long')
+        logger.info(f"Training LightGBM model for {direction} {target_days}-day prediction")
         
         X_train, y_train = data['X_train'], data['y_train']
         X_val, y_val = data['X_val'], data['y_val']
@@ -1308,8 +1487,8 @@ class StockPredictionFramework:
         plt.savefig(f'{self.results_dir}/lgbm_feature_importance_{target_days}d.png')
         plt.close()
         
-        # Save model
-        model_path = f'{self.models_dir}/lgbm_model_{target_days}d.pkl'
+        # Example of updated path:
+        model_path = f'{self.models_dir}/lgbm_model_{direction}_{target_days}d.pkl'
         joblib.dump(model, model_path)
         logger.info(f"Model saved to {model_path}")
         
@@ -1317,7 +1496,7 @@ class StockPredictionFramework:
   
     def apply_smote(self, data, target_days):
         """
-        Apply SMOTE to handle class imbalance
+        Apply SMOTE to handle class imbalance with safeguards for sparse data
         
         Args:
             data: Dictionary with prepared data
@@ -1326,36 +1505,62 @@ class StockPredictionFramework:
         Returns:
             Updated data dictionary with resampled training data
         """
-        from imblearn.over_sampling import SMOTE
+        from imblearn.over_sampling import SMOTE, SMOTENC
         
         logger.info(f"Applying SMOTE for {target_days}-day prediction")
         
         X_train, y_train = data['X_train'], data['y_train']
         
         # Check if minority class has enough samples
-        if np.sum(y_train == 1) >= 5:  # SMOTE needs at least 5 samples of minority class
-            # Apply SMOTE to training data
-            smote = SMOTE(random_state=42)
-            X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
-            
-            # Log resampling results
-            original_shape = X_train.shape
-            new_shape = X_train_resampled.shape
-            original_pos = np.sum(y_train == 1)
-            new_pos = np.sum(y_train_resampled == 1)
-            
-            logger.info(f"SMOTE resampling: {original_shape[0]} -> {new_shape[0]} samples")
-            logger.info(f"Positive class: {original_pos} -> {new_pos} samples")
-            
-            # Update data dictionary
-            data['X_train'] = X_train_resampled
-            data['y_train'] = y_train_resampled
+        positive_samples = np.sum(y_train == 1)
+        
+        if positive_samples >= 5:  # SMOTE needs at least 5 samples of minority class
+            try:
+                # Analyze data sparsity
+                sparse_features = []
+                for i in range(X_train.shape[1]):
+                    # Check if feature has very few unique values
+                    unique_values = np.unique(X_train[:, i])
+                    if len(unique_values) < 5:
+                        sparse_features.append(i)
+                
+                # If we have sparse features, use SMOTENC which is better for categorical/sparse features
+                if len(sparse_features) > 0:
+                    logger.info(f"Using SMOTENC for {len(sparse_features)} sparse features")
+                    smote = SMOTENC(categorical_features=sparse_features, random_state=42, k_neighbors=min(positive_samples-1, 5))
+                else:
+                    # Regular SMOTE with reduced k_neighbors for small datasets
+                    k_neighbors = min(positive_samples-1, 5)  # k must be <= n_minority_samples - 1
+                    smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+                
+                # Apply SMOTE with sampling_strategy < 1.0 to avoid excessive oversampling
+                # This creates a more realistic but still improved class balance
+                sampling_strategy = min(0.5, (len(y_train) - positive_samples) / positive_samples)
+                smote.sampling_strategy = sampling_strategy
+                
+                X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+                
+                # Log resampling results
+                original_shape = X_train.shape
+                new_shape = X_train_resampled.shape
+                original_pos = np.sum(y_train == 1)
+                new_pos = np.sum(y_train_resampled == 1)
+                
+                logger.info(f"SMOTE resampling: {original_shape[0]} -> {new_shape[0]} samples")
+                logger.info(f"Positive class: {original_pos} -> {new_pos} samples")
+                
+                # Update data dictionary
+                data['X_train'] = X_train_resampled
+                data['y_train'] = y_train_resampled
+                
+            except Exception as e:
+                logger.warning(f"SMOTE failed: {str(e)}. Using original imbalanced data.")
         else:
             logger.warning(f"Not enough minority samples for SMOTE. Using original data.")
         
         return data
     
-    def train_pytorch_model(self, data, target_days, enhanced=False):
+    def train_pytorch_model(self, data, target_days=5, enhanced=False):
         """
         Train PyTorch neural network for stock prediction utilizing GPU
         
@@ -1367,7 +1572,8 @@ class StockPredictionFramework:
         Returns:
             Trained PyTorch model
         """
-        logger.info(f"Training PyTorch model for {target_days}-day prediction")
+        direction = data.get('direction', 'long')
+        logger.info(f"Training PyTorch model for {direction} {target_days}-day prediction")
         
         X_train, y_train = data['X_train'], data['y_train']
         X_val, y_val = data['X_val'], data['y_val']
@@ -1561,16 +1767,15 @@ class StockPredictionFramework:
         torch.save(model.state_dict(), model_path)
         logger.info(f"PyTorch model saved to {model_path}")
         
-        # Memory cleanup
-        del X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor
-        del train_dataset, val_dataset, train_loader, val_loader
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Example of updated path:
+        model_path = f'{self.models_dir}/pytorch_model_{direction}_{target_days}d.pt'
+        torch.save(model.state_dict(), model_path)
+        logger.info(f"PyTorch model saved to {model_path}")
         
         return model
     def train_all_models(self):
         """
-        Train models for all prediction horizons - with focus on primary horizon
+        Train models for all prediction horizons and both long/short directions
         """
         # Fetch and preprocess data
         df = self.fetch_historical_data()
@@ -1584,67 +1789,89 @@ class StockPredictionFramework:
             logger.error("Feature engineering failed. Exiting.")
             return
         
-        # Train models for each horizon
+        # Train models for each horizon and direction
         for days in self.prediction_horizon_days:
             is_primary = days == self.primary_horizon
-            logger.info(f"Starting training pipeline for {days}-day prediction horizon" + 
+            
+            # Train long models
+            logger.info(f"Starting training pipeline for LONG {days}-day prediction horizon" + 
                     (" (PRIMARY)" if is_primary else ""))
+            self.train_direction_models(df_with_features, days, direction="long", is_primary=is_primary)
             
-            # Analyze and select features
-            # For primary horizon, use a larger dataset and more resources
-            if is_primary:
-                logger.info("Using enhanced resources for primary horizon")
-                correlation_threshold = 0.04  # Lower threshold to include more potential features
-                selected_features = self.analyze_features(df_with_features, target_days=days, 
-                                                        correlation_threshold=correlation_threshold)
-            else:
-                selected_features = self.analyze_features(df_with_features, target_days=days)
+            # Train short models
+            logger.info(f"Starting training pipeline for SHORT {days}-day prediction horizon" + 
+                    (" (PRIMARY)" if is_primary else ""))
+            self.train_direction_models(df_with_features, days, direction="short", is_primary=is_primary)
             
-            # Prepare data
-            data = self.prepare_data_for_training(df_with_features, target_days=days)
-            
-            # Apply SMOTE for resampling
+        logger.info("All models trained successfully")
+
+    def train_direction_models(self, df_with_features, days, direction="long", is_primary=False):
+        """Helper method to train models for a specific direction (long or short)"""
+        target_col = f'target_{direction}_{days}d'
+        
+        # Analyze and select features
+        correlation_threshold = 0.04 if is_primary else 0.05
+        selected_features = self.analyze_features(df_with_features, target_days=days, 
+                                            target_col=target_col,
+                                            correlation_threshold=correlation_threshold)
+        
+        # Store features with direction
+        self.selected_features[f'{direction}_{days}d'] = selected_features
+        
+        # Prepare data
+        data = self.prepare_data_for_training(df_with_features, target_days=days, target_col=target_col)
+        
+        if data is None:
+            logger.error(f"Failed to prepare data for {direction} {days}d model. Skipping.")
+            return
+        
+        # Check class balance and apply appropriate sampling strategy
+        positive_samples = np.sum(data['y_train'] == 1)
+        total_samples = len(data['y_train'])
+        class_ratio = positive_samples / total_samples
+        
+        logger.info(f"{direction} {days}d - Class balance: {positive_samples}/{total_samples} ({class_ratio:.2%})")
+        
+        # Only proceed if we have enough minority class samples
+        # For binary classification, we need at least some positive examples
+        if positive_samples < 5:
+            logger.warning(f"Too few positive samples ({positive_samples}) for {direction} {days}d model. Skipping.")
+            return
+        
+        # For severe imbalance, apply SMOTE if we have enough positive samples
+        if class_ratio < 0.1 and positive_samples >= 5:
             data = self.apply_smote(data, target_days=days)
-            
-            # For primary horizon, use more trials in optimization
-            if is_primary:
-                # Optimize LightGBM with more trials
-                logger.info("Running extended hyperparameter optimization for primary horizon")
-                best_params = self.optimize_lightgbm(data, target_days=days, n_trials=50)
-            else:
-                # Standard optimization
-                best_params = self.optimize_lightgbm(data, target_days=days)
-            
-            # Add class_weight to best_params
-            best_params['class_weight'] = 'balanced'
+            # Recalculate class distribution after SMOTE
+            new_positive = np.sum(data['y_train'] == 1)
+            new_total = len(data['y_train'])
+            logger.info(f"After SMOTE: {new_positive}/{new_total} ({new_positive/new_total:.2%})")
+        
+        try:
+            # Optimize hyperparameters with data-aware parameter constraints
+            n_trials = 50 if is_primary else 30
+            best_params = self.optimize_lightgbm(data, target_days=days, direction=direction, n_trials=n_trials)
             
             # Train LightGBM model with optimized parameters
-            logger.info(f"Training LightGBM model for {days}-day prediction")
             lgbm_model = self.train_lightgbm_model(data, target_days=days, params=best_params)
+            if lgbm_model is not None:
+                self.models[f'lgbm_{direction}_{days}d'] = lgbm_model
             
-            # For primary horizon, use more epochs and a larger network
-            if is_primary:
-                logger.info("Training enhanced PyTorch model for primary horizon")
-                pytorch_model = self.train_pytorch_model(data, target_days=days, enhanced=True)
-            else:
-                logger.info(f"Training PyTorch model for {days}-day prediction")
-                pytorch_model = self.train_pytorch_model(data, target_days=days)
+            # Train PyTorch model
+            pytorch_model = self.train_pytorch_model(data, target_days=days, enhanced=is_primary)
+            if pytorch_model is not None:
+                self.models[f'pytorch_{direction}_{days}d'] = pytorch_model
             
-            # Store models
-            self.models[f'lgbm_{days}d'] = lgbm_model
-            self.models[f'pytorch_{days}d'] = pytorch_model
-            self.save_scalers()
-            logger.info("All models trained successfully and scalers saved")
+            # Save scaler
+            self.scalers[f'{direction}_{days}d'] = data['scaler']
             
-            # Clean up to free memory
-            torch.cuda.empty_cache()
-            gc.collect()
-                
-        logger.info("All models trained successfully")
+        except Exception as e:
+            logger.error(f"Error training models for {direction} {days}d: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def create_feature_importance_report(self):
         """
-        Create a consolidated report of feature importance across all horizons
+        Create a consolidated report of feature importance across all horizons and directions
         """
         logger.info("Creating feature importance report")
         
@@ -1653,10 +1880,10 @@ class StockPredictionFramework:
             logger.warning("No feature importance data available")
             return
         
-        # Consolidate feature importance across all horizons
+        # Consolidate feature importance across all horizons and directions
         all_features = set()
-        for horizon_importances in self.feature_importance.values():
-            all_features.update(horizon_importances.keys())
+        for key, importances in self.feature_importance.items():
+            all_features.update(importances.keys())
         
         # Create a DataFrame with all features and their importance across horizons
         consolidated_data = []
@@ -1664,39 +1891,82 @@ class StockPredictionFramework:
         for feature in all_features:
             feature_data = {'feature': feature}
             
-            # Add importance for each horizon
-            for horizon, importances in self.feature_importance.items():
-                feature_data[f'importance_{horizon}d'] = importances.get(feature, 0)
-                
-            # Calculate average importance across horizons
-            importance_values = [v for k, v in feature_data.items() if k.startswith('importance_')]
-            feature_data['avg_importance'] = sum(importance_values) / len(importance_values)
+            # Group by direction
+            long_importances = []
+            short_importances = []
             
+            # Add importance for each horizon and direction
+            for key, importances in self.feature_importance.items():
+                if 'long' in key:
+                    if feature in importances:
+                        horizon = int(key.split('_')[-1].replace('d', ''))
+                        feature_data[f'long_{horizon}d'] = importances[feature]
+                        long_importances.append(importances[feature])
+                elif 'short' in key:
+                    if feature in importances:
+                        horizon = int(key.split('_')[-1].replace('d', ''))
+                        feature_data[f'short_{horizon}d'] = importances[feature]
+                        short_importances.append(importances[feature])
+            
+            # Calculate average importance by direction
+            if long_importances:
+                feature_data['avg_long_importance'] = sum(long_importances) / len(long_importances)
+            else:
+                feature_data['avg_long_importance'] = 0
+                
+            if short_importances:
+                feature_data['avg_short_importance'] = sum(short_importances) / len(short_importances)
+            else:
+                feature_data['avg_short_importance'] = 0
+                
+            # Overall average
+            all_importances = long_importances + short_importances
+            if all_importances:
+                feature_data['avg_overall_importance'] = sum(all_importances) / len(all_importances)
+            else:
+                feature_data['avg_overall_importance'] = 0
+                
             consolidated_data.append(feature_data)
         
         # Create DataFrame and sort by average importance
         consolidated_df = pd.DataFrame(consolidated_data)
-        consolidated_df = consolidated_df.sort_values('avg_importance', ascending=False)
+        consolidated_df = consolidated_df.sort_values('avg_overall_importance', ascending=False)
         
         # Save to CSV
         report_path = f'{self.results_dir}/feature_importance_report.csv'
         consolidated_df.to_csv(report_path, index=False)
         logger.info(f"Feature importance report saved to {report_path}")
         
-        # Create bar chart of top 30 features by average importance
+        # Create visualizations for long vs short feature importance
         plt.figure(figsize=(14, 10))
-        top_features = consolidated_df.head(30)
-        sns.barplot(x='avg_importance', y='feature', data=top_features)
-        plt.title('Top 30 Features by Average Importance Across All Horizons')
+        
+        # Top 20 features
+        top_features = consolidated_df.head(20)
+        
+        # Create bar chart comparing long vs short importance
+        plt.figure(figsize=(12, 8))
+        
+        x = np.arange(len(top_features))
+        width = 0.35
+        
+        plt.bar(x - width/2, top_features['avg_long_importance'], width, label='Long')
+        plt.bar(x + width/2, top_features['avg_short_importance'], width, label='Short')
+        
+        plt.xlabel('Features')
+        plt.ylabel('Average Importance')
+        plt.title('Feature Importance: Long vs Short')
+        plt.xticks(x, top_features['feature'], rotation=90)
+        plt.legend()
         plt.tight_layout()
-        plt.savefig(f'{self.results_dir}/top_features_avg_importance.png')
+        
+        plt.savefig(f'{self.results_dir}/long_vs_short_feature_importance.png')
         plt.close()
         
         return consolidated_df
     
     def evaluate_models(self):
         """
-        Evaluate all trained models - optimized for PyTorch
+        Evaluate all trained models for both long and short predictions
         
         Returns:
             DataFrame with evaluation metrics
@@ -1704,30 +1974,34 @@ class StockPredictionFramework:
         results = []
         
         for days in self.prediction_horizon_days:
-            logger.info(f"Evaluating models for {days}-day prediction horizon")
-            
-            # Load data
-            df = self.fetch_historical_data()
-            df_with_features = self.engineer_features(df)
-            data = self.prepare_data_for_training(df_with_features, target_days=days)
-            
-            if data is None:
-                logger.error(f"Data preparation failed for {days}-day prediction")
-                continue
+            for direction in ['long', 'short']:
+                logger.info(f"Evaluating {direction} models for {days}-day prediction horizon")
+                
+                # Load data
+                df = self.fetch_historical_data()
+                df_with_features = self.engineer_features(df)
+                
+                # Use direction-specific target
+                target_col = f'target_{direction}_{days}d'
+                data = self.prepare_data_for_training(df_with_features, target_days=days, target_col=target_col)
+                
+                if data is None:
+                    logger.error(f"Data preparation failed for {direction} {days}-day prediction")
+                    continue
                     
             X_test, y_test = data['X_test'], data['y_test']
             test_df = data['test_df']
             
             # Evaluate LightGBM model
-            lgbm_model = self.models.get(f'lgbm_{days}d')
+            lgbm_model = self.models.get(f'lgbm_{direction}_{days}d')
             if lgbm_model is None:
                 # Try to load from file
                 try:
-                    model_path = f'{self.models_dir}/lgbm_model_{days}d.pkl'
+                    model_path = f'{self.models_dir}/lgbm_model_{direction}_{days}d.pkl'
                     lgbm_model = joblib.load(model_path)
-                    self.models[f'lgbm_{days}d'] = lgbm_model
+                    self.models[f'lgbm_{direction}_{days}d'] = lgbm_model
                 except:
-                    logger.error(f"Could not load LightGBM model for {days}-day prediction")
+                    logger.error(f"Could not load LightGBM model for {direction} {days}-day prediction")
                     continue
             
             # Make predictions
@@ -1786,7 +2060,7 @@ class StockPredictionFramework:
             roc_curves.append((fpr_lgbm, tpr_lgbm, f'LightGBM (AUC = {auc_lgbm:.3f})'))
             
             # Evaluate PyTorch model
-            pytorch_model = self.models.get(f'pytorch_{days}d')
+            pytorch_model = self.models.get(f'pytorch_{direction}_{days}d')
             if pytorch_model is None:
                 # Try to load from file
                 try:
@@ -1893,6 +2167,7 @@ class StockPredictionFramework:
             gc.collect()
         
         # Create results DataFrame
+        # Create results DataFrame
         results_df = pd.DataFrame(results)
         
         # Save results
@@ -1962,30 +2237,42 @@ class StockPredictionFramework:
             logger.info(f"Saved scaler for {days}-day horizon to {scaler_path}")
     
     def load_scalers(self):
-        """Load all scalers from disk"""
+        """Load all scalers from disk for both long and short predictions"""
         logger.info("Loading scalers...")
-        for days in self.prediction_horizon_days:
-            scaler_path = f'{self.models_dir}/scaler_{days}d.pkl'
-            try:
-                scaler = joblib.load(scaler_path)
-                self.scalers[days] = scaler
-                logger.info(f"Loaded scaler for {days}-day horizon")
-            except Exception as e:
-                logger.warning(f"Could not load scaler for {days}-day horizon: {e}")
+        loaded_scalers = 0
         
-        return len(self.scalers) > 0
+        for days in self.prediction_horizon_days:
+            for direction in ['long', 'short']:
+                scaler_path = f'{self.models_dir}/scaler_{direction}_{days}d.pkl'
+                try:
+                    scaler = joblib.load(scaler_path)
+                    self.scalers[f'{direction}_{days}d'] = scaler
+                    loaded_scalers += 1
+                    logger.info(f"Loaded scaler for {direction} {days}-day horizon")
+                except Exception as e:
+                    logger.warning(f"Could not load scaler for {direction} {days}-day horizon: {e}")
+        
+        return loaded_scalers > 0
     
-    def backtest(self, start_date=None, end_date=None, confidence_threshold=0.01):
-        """Improved backtest implementation with better filtering and debugging"""
-        logger.info(f"Starting backtesting process with confidence threshold {confidence_threshold}")
-        logger.info(f"Date range: {start_date or 'beginning'} to {end_date or 'end'}")
-
+    def backtest(self, start_date=None, end_date=None, confidence_threshold=0.7, batch_size=64):
+        """
+        GPU-accelerated backtesting process for both long and short predictions
+        
+        Args:
+            start_date: Start date for backtesting
+            end_date: End date for backtesting
+            confidence_threshold: Confidence threshold for taking trades
+            batch_size: Batch size for GPU processing
+            
+        Returns:
+            DataFrame with backtest results
+        """
+        logger.info(f"Starting GPU-accelerated backtesting from {start_date} to {end_date}")
+        
         # Ensure scalers are loaded
-        if sum(1 for _ in self.scalers.values()) < len(self.prediction_horizon_days):
-            logger.info("Some scalers not in memory, attempting to load from disk...")
-            if not self.load_scalers():
-                logger.error("Failed to load scalers. Cannot proceed with backtesting/prediction.")
-                return None
+        if not self.load_scalers():
+            logger.error("Failed to load scalers. Cannot proceed with backtesting.")
+            return None
         
         # Fetch data
         df = self.fetch_historical_data()
@@ -1999,268 +2286,644 @@ class StockPredictionFramework:
             logger.error("Feature engineering failed for backtesting")
             return None
             
-        # Get all unique dates and sort
-        all_dates = sorted(df_with_features['date'].unique())
-        
-        # Apply date filtering to the list of dates
+        # Filter data by date
         if start_date:
             start_date = pd.to_datetime(start_date)
-            dates = [d for d in all_dates if d >= start_date]
-            logger.info(f"Filtered dates after {start_date}: {len(dates)} trading days")
-        else:
-            dates = all_dates
+            df_with_features = df_with_features[df_with_features['date'] >= start_date]
         
         if end_date:
             end_date = pd.to_datetime(end_date)
-            dates = [d for d in dates if d <= end_date]
-            logger.info(f"Filtered dates before {end_date}: {len(dates)} trading days")
+            df_with_features = df_with_features[df_with_features['date'] <= end_date]
         
-        # Sample every 5 trading days
-        sampled_dates = dates[::5]
-        logger.info(f"Sampling {len(sampled_dates)} dates for backtesting")
+        # Get all unique dates and sort
+        dates = sorted(df_with_features['date'].unique())
+        logger.info(f"Backtesting over {len(dates)} trading days")
         
         # Initialize results storage
-        backtest_results = []
+        trades = []
+        portfolio_values = []
+        initial_capital = 100000  # Initial capital of ₹1 lakh
+        available_capital = initial_capital
+        open_positions = {}  # Dictionary to track open positions
         
-        # Ensure required data structures are initialized
-        if not hasattr(self, 'optimal_thresholds'):
-            self.optimal_thresholds = {}
+        # Batch processing for faster prediction
+        def process_prediction_batch(batch_data, direction, days):
+            # Get model path keys
+            lgbm_key = f'lgbm_{direction}_{days}d'
+            pytorch_key = f'pytorch_{direction}_{days}d'
+            scaler_key = f'{direction}_{days}d'
+            
+            # Ensure models and scaler exist
+            if lgbm_key not in self.models or pytorch_key not in self.models or scaler_key not in self.scalers:
+                return None
+            
+            # Get feature names
+            feature_names = self.selected_features.get(f'{direction}_{days}d', [])
+            if not feature_names:
+                return None
+            
+            # Extract features
+            features = batch_data[feature_names].values
+            
+            # Scale features
+            scaler = self.scalers[scaler_key]
+            features_scaled = scaler.transform(features)
+            
+            # LightGBM prediction
+            lgbm_model = self.models[lgbm_key]
+            lgbm_proba = lgbm_model.predict_proba(features_scaled)[:, 1]
+            
+            # PyTorch prediction (using GPU for batch processing)
+            pytorch_model = self.models[pytorch_key]
+            features_tensor = torch.FloatTensor(features_scaled).to(self.device)
+            
+            pytorch_model.eval()
+            with torch.no_grad():
+                batch_nn_proba = pytorch_model(features_tensor).squeeze().cpu().numpy()
+            
+            # Get model weights for this horizon
+            weights = self.get_model_weights(days)
+            
+            # Calculate ensemble probabilities
+            ensemble_proba = lgbm_proba * weights['lgbm'] + batch_nn_proba * weights['pytorch']
+            
+            return ensemble_proba
         
-        for i, current_date in enumerate(sampled_dates[:-max(self.prediction_horizon_days)]):
-            logger.info(f"Backtesting for date: {current_date}")
+        # Process each date
+        for date_idx, current_date in enumerate(dates[:-max(self.prediction_horizon_days)]):
+            logger.info(f"Backtesting day {date_idx+1}/{len(dates)}: {current_date}")
             
-            # Get data up to current date
-            df_up_to_date = df_with_features[df_with_features['date'] <= current_date].copy()
+            # Get data for the current date
+            current_data = df_with_features[df_with_features['date'] == current_date]
             
-            # Get unique symbols on current date
-            symbols = df_with_features[df_with_features['date'] == current_date]['trading_symbol'].unique()
-            # Sample 20 random stocks
-            if len(symbols) > 20:
-                symbols = np.random.choice(symbols, 20, replace=False)
-            
-            logger.info(f"Testing {len(symbols)} stocks on {current_date}")
-            stocks_with_signals = 0
-            
-            for symbol in symbols:
-                # Get data for this symbol
-                symbol_data = df_up_to_date[df_up_to_date['trading_symbol'] == symbol].copy()
+            # Skip if no data for current date
+            if len(current_data) == 0:
+                continue
                 
-                # Skip if not enough data
-                if len(symbol_data) < 30:
-                    logger.debug(f"Skipping {symbol}: insufficient history ({len(symbol_data)} records)")
+            # Process batches of stocks for each horizon and direction
+            for days in self.prediction_horizon_days:
+                for direction in ['long', 'short']:
+                    # Process in batches to utilize GPU effectively
+                    for batch_start in range(0, len(current_data), batch_size):
+                        batch_end = min(batch_start + batch_size, len(current_data))
+                        batch = current_data.iloc[batch_start:batch_end]
+                        
+                        # Get predictions for this batch
+                        confidence_scores = process_prediction_batch(batch, direction, days)
+                        
+                        if confidence_scores is None:
+                            continue
+                        
+                        # Process each stock in the batch
+                        for i, (idx, row) in enumerate(batch.iterrows()):
+                            if confidence_scores[i] >= confidence_threshold:
+                                symbol = row['trading_symbol']
+                                current_price = row['close']
+                                
+                                # Determine target price based on direction
+                                if direction == 'long':
+                                    target_price = current_price * (1 + self.upside_threshold_min)
+                                    stop_loss = current_price * (1 - 0.005)  # 0.5% stop loss
+                                else:  # short
+                                    target_price = current_price * (1 - self.downside_threshold_min)
+                                    stop_loss = current_price * (1 + 0.005)  # 0.5% stop loss
+                                
+                                # Simulate trade
+                                position_size = min(available_capital * 0.1, 10000)  # 10% of capital or max ₹10k
+                                
+                                # Add to open positions
+                                position_id = f"{symbol}_{direction}_{current_date}_{days}d"
+                                open_positions[position_id] = {
+                                    'symbol': symbol,
+                                    'entry_date': current_date,
+                                    'direction': direction,
+                                    'horizon': days,
+                                    'entry_price': current_price,
+                                    'target_price': target_price,
+                                    'stop_loss': stop_loss,
+                                    'position_size': position_size,
+                                    'shares': position_size / current_price,
+                                    'confidence': confidence_scores[i]
+                                }
+                                
+                                # Reduce available capital
+                                available_capital -= position_size
+                                
+                                # Log trade
+                                logger.info(f"Opening {direction} position: {symbol} at {current_price} (Target: {target_price})")
+            
+            # Check for position exits (both target and stop-loss)
+            positions_to_remove = []
+            
+            for position_id, position in open_positions.items():
+                symbol = position['symbol']
+                entry_date = position['entry_date']
+                direction = position['direction']
+                entry_price = position['entry_price']
+                target_price = position['target_price']
+                stop_loss = position['stop_loss']
+                
+                # Get data for this symbol since entry
+                future_data = df_with_features[
+                    (df_with_features['trading_symbol'] == symbol) & 
+                    (df_with_features['date'] > entry_date) & 
+                    (df_with_features['date'] <= current_date)
+                ]
+                
+                if len(future_data) == 0:
                     continue
                     
-                # Latest data point for this symbol
-                latest_data = symbol_data.iloc[-1]
+                # Check if target or stop-loss was hit
+                exit_triggered = False
+                exit_date = None
+                exit_price = None
+                exit_type = None
                 
-                for days in self.prediction_horizon_days:
-                    # Skip if we don't have enough future data to validate
-                    if i + days >= len(dates):
-                        continue
-                        
-                    # Ensure features are selected for this horizon
-                    if days not in self.selected_features or not self.selected_features[days]:
-                        self.selected_features[days] = self.analyze_features(df_with_features, target_days=days)
+                for _, row in future_data.iterrows():
+                    if direction == 'long':
+                        # For long positions
+                        if row['high'] >= target_price:
+                            exit_triggered = True
+                            exit_date = row['date']
+                            exit_price = target_price
+                            exit_type = 'target'
+                            break
+                        elif row['low'] <= stop_loss:
+                            exit_triggered = True
+                            exit_date = row['date']
+                            exit_price = stop_loss
+                            exit_type = 'stop_loss'
+                            break
+                    else:
+                        # For short positions
+                        if row['low'] <= target_price:
+                            exit_triggered = True
+                            exit_date = row['date']
+                            exit_price = target_price
+                            exit_type = 'target'
+                            break
+                        elif row['high'] >= stop_loss:
+                            exit_triggered = True
+                            exit_date = row['date']
+                            exit_price = stop_loss
+                            exit_type = 'stop_loss'
+                            break
+                
+                # If position is still open and max holding period is reached
+                if not exit_triggered and (current_date - entry_date).days >= position['horizon']:
+                    exit_triggered = True
+                    exit_date = current_date
+                    exit_price = future_data.iloc[-1]['close']
+                    exit_type = 'horizon'
+                
+                # Process exit if triggered
+                if exit_triggered:
+                    # Calculate profit/loss
+                    if direction == 'long':
+                        pnl = (exit_price - entry_price) * position['shares']
+                    else:  # short
+                        pnl = (entry_price - exit_price) * position['shares']
                     
-                    # Extract features
-                    features = self.selected_features.get(days, [])
-                    if not features:
-                        logger.warning(f"No features available for {days}-day horizon")
-                        continue
+                    # Update available capital
+                    available_capital += position['position_size'] + pnl
                     
-                    if any(pd.isna(latest_data[features])):
-                        logger.debug(f"Skipping {symbol} for {days}d: missing feature values")
-                        continue
-                        
-                    # Prepare input data
-                    X = latest_data[features].values.reshape(1, -1)
+                    # Record the trade
+                    trades.append({
+                        'symbol': symbol,
+                        'direction': direction,
+                        'entry_date': entry_date,
+                        'exit_date': exit_date,
+                        'holding_days': (exit_date - entry_date).days,
+                        'entry_price': entry_price,
+                        'exit_price': exit_price,
+                        'exit_type': exit_type,
+                        'position_size': position['position_size'],
+                        'pnl': pnl,
+                        'return_pct': (pnl / position['position_size']) * 100,
+                        'confidence': position['confidence']
+                    })
                     
-                    # Ensure scaler exists
-                    if days not in self.scalers:
-                        logger.warning(f"No scaler available for {days}-day horizon")
-                        continue
+                    # Log exit
+                    logger.info(f"Closing {direction} position: {symbol} at {exit_price} ({exit_type}, PnL: {pnl:.2f})")
                     
-                    # Scale data
-                    scaler = self.scalers.get(days)
-                    X_scaled = scaler.transform(X)
-                    
-                    # Ensure LightGBM model is loaded
-                    lgbm_model = self.ensure_model_loaded('lgbm', days)
-                    if lgbm_model is None:
-                        logger.debug(f"Skipping {symbol} for {days}d: LightGBM model unavailable")
-                        continue
-                        
-                    # Make LightGBM prediction
-                    lgbm_proba = lgbm_model.predict_proba(X_scaled)[0, 1]
-                    
-                    # Ensure PyTorch model is loaded
-                    pytorch_model = self.ensure_model_loaded('pytorch', days)
-                    if pytorch_model is None:
-                        logger.debug(f"Skipping {symbol} for {days}d: PyTorch model unavailable")
-                        continue
-                    
-                    # Make PyTorch prediction
-                    X_tensor = torch.FloatTensor(X_scaled).to(self.device)
-                    pytorch_model.eval()
-                    with torch.no_grad():
-                        nn_proba = pytorch_model(X_tensor).item()
-                    
-                    # Get model weights for this horizon
-                    weights = self.get_model_weights(days)
-                    
-                    # Weighted ensemble prediction
-                    ensemble_proba = (lgbm_proba * weights['lgbm'] + nn_proba * weights['pytorch'])
-                    
-                    # Log probability values for debugging
-                    logger.debug(f"{symbol} {days}d - LGBM: {lgbm_proba:.4f}, NN: {nn_proba:.4f}, Ensemble: {ensemble_proba:.4f}")
-                    
-                    # Only consider predictions above threshold
-                    if ensemble_proba >= confidence_threshold:
-                        logger.info(f"Signal detected: {symbol}, {days}d horizon, confidence: {ensemble_proba:.4f}")
-                        stocks_with_signals += 1
-                        
-                        # Calculate target price
-                        current_price = latest_data['close']
-                        target_price = current_price * (1 + self.upside_threshold_min)
-                        
-                        # Get future data to validate prediction
-                        future_date = dates[i + days]
-                        future_data = df_with_features[
-                            (df_with_features['trading_symbol'] == symbol) & 
-                            (df_with_features['date'] >= current_date) & 
-                            (df_with_features['date'] <= future_date)
-                        ].copy()
-                        
-                        # Check if we have future data
-                        if future_data.empty:
-                            logger.debug(f"No future data for {symbol} from {current_date} to {future_date}")
-                            continue
-                            
-                        # Check if price target was reached
-                        max_price = future_data['high'].max()
-                        target_reached = max_price >= target_price
-                        
-                        # Find when target was reached (if at all)
-                        days_to_target = None
-                        if target_reached:
-                            for j, row in future_data.iterrows():
-                                if row['high'] >= target_price:
-                                    days_to_target = (row['date'] - current_date).days
-                                    break
-                            logger.info(f"Target reached for {symbol} in {days_to_target} days")
-                        
-                        # Store result
-                        backtest_results.append({
-                            'date': current_date,
-                            'trading_symbol': symbol,
-                            'company_name': latest_data['company_name'],
-                            'prediction_horizon': days,
-                            'confidence_score': ensemble_proba,
-                            'lgbm_confidence': lgbm_proba,
-                            'nn_confidence': nn_proba,
-                            'current_price': current_price,
-                            'target_price': target_price,
-                            'max_future_price': max_price,
-                            'target_reached': target_reached,
-                            'days_to_target': days_to_target,
-                            'return_achieved': (max_price / current_price) - 1 if not pd.isna(max_price) else None
-                        })
+                    # Mark for removal
+                    positions_to_remove.append(position_id)
             
-            logger.info(f"Found {stocks_with_signals} stocks with signals on {current_date}")
+            # Remove closed positions
+            for position_id in positions_to_remove:
+                del open_positions[position_id]
+            
+            # Calculate portfolio value at end of day
+            current_portfolio_value = available_capital
+            for position in open_positions.values():
+                # Get the latest price
+                latest_data = df_with_features[
+                    (df_with_features['trading_symbol'] == position['symbol']) & 
+                    (df_with_features['date'] == current_date)
+                ]
+                
+                if len(latest_data) > 0:
+                    current_price = latest_data.iloc[0]['close']
+                    
+                    # Calculate position value
+                    if position['direction'] == 'long':
+                        position_value = position['shares'] * current_price
+                    else:  # short
+                        position_value = position['position_size'] + ((position['entry_price'] - current_price) * position['shares'])
+                    
+                    current_portfolio_value += position_value
+            
+            # Record portfolio value
+            portfolio_values.append({
+                'date': current_date,
+                'portfolio_value': current_portfolio_value,
+                'available_capital': available_capital,
+                'open_positions': len(open_positions)
+            })
         
-        # Create DataFrame from results
-        if backtest_results:
-            results_df = pd.DataFrame(backtest_results)
+        # Close any remaining open positions at the last date
+        last_date = dates[-1]
+        positions_to_remove = []
+        
+        for position_id, position in open_positions.items():
+            symbol = position['symbol']
+            entry_date = position['entry_date']
+            direction = position['direction']
+            entry_price = position['entry_price']
             
-            # Calculate backtest metrics
-            success_rate = results_df['target_reached'].mean()
-            avg_return = results_df['return_achieved'].mean()
-            avg_days_to_target = results_df.loc[results_df['target_reached'], 'days_to_target'].mean()
+            # Get latest data for this symbol
+            latest_data = df_with_features[
+                (df_with_features['trading_symbol'] == symbol) & 
+                (df_with_features['date'] == last_date)
+            ]
             
-            logger.info(f"Backtest Results:")
-            logger.info(f"Number of predictions: {len(results_df)}")
-            logger.info(f"Success rate: {success_rate:.2%}")
-            logger.info(f"Average return: {avg_return:.2%}")
-            logger.info(f"Average days to target: {avg_days_to_target:.1f}")
+            if len(latest_data) > 0:
+                exit_price = latest_data.iloc[0]['close']
+            else:
+                # If no data on last date, find the most recent price
+                symbol_data = df_with_features[
+                    (df_with_features['trading_symbol'] == symbol) & 
+                    (df_with_features['date'] > entry_date)
+                ].sort_values('date', ascending=False)
+                
+                if len(symbol_data) > 0:
+                    exit_price = symbol_data.iloc[0]['close']
+                else:
+                    exit_price = entry_price  # Fall back to entry price
+            
+            # Calculate profit/loss
+            if direction == 'long':
+                pnl = (exit_price - entry_price) * position['shares']
+            else:  # short
+                pnl = (entry_price - exit_price) * position['shares']
+            
+            # Record the trade
+            trades.append({
+                'symbol': symbol,
+                'direction': direction,
+                'entry_date': entry_date,
+                'exit_date': last_date,
+                'holding_days': (last_date - entry_date).days,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'exit_type': 'end_of_period',
+                'position_size': position['position_size'],
+                'pnl': pnl,
+                'return_pct': (pnl / position['position_size']) * 100,
+                'confidence': position['confidence']
+            })
+            
+            positions_to_remove.append(position_id)
+        
+        # Remove closed positions
+        for position_id in positions_to_remove:
+            del open_positions[position_id]
+        
+        # Create results DataFrames
+        trades_df = pd.DataFrame(trades)
+        portfolio_df = pd.DataFrame(portfolio_values)
+        
+        # Calculate backtest metrics
+        if len(trades_df) > 0:
+            # Calculate basic metrics
+            total_trades = len(trades_df)
+            profitable_trades = sum(trades_df['pnl'] > 0)
+            win_rate = profitable_trades / total_trades
+            avg_profit = trades_df[trades_df['pnl'] > 0]['pnl'].mean() if profitable_trades > 0 else 0
+            avg_loss = trades_df[trades_df['pnl'] < 0]['pnl'].mean() if len(trades_df[trades_df['pnl'] < 0]) > 0 else 0
+            profit_factor = abs(trades_df[trades_df['pnl'] > 0]['pnl'].sum() / trades_df[trades_df['pnl'] < 0]['pnl'].sum()) if trades_df[trades_df['pnl'] < 0]['pnl'].sum() != 0 else float('inf')
+            
+            # Calculate returns
+            initial_value = portfolio_df.iloc[0]['portfolio_value']
+            final_value = portfolio_df.iloc[-1]['portfolio_value']
+            total_return = (final_value / initial_value) - 1
+            trading_days = len(portfolio_df)
+            annualized_return = (1 + total_return) ** (252 / trading_days) - 1
+            
+            # Calculate drawdown
+            portfolio_df['cummax'] = portfolio_df['portfolio_value'].cummax()
+            portfolio_df['drawdown'] = (portfolio_df['portfolio_value'] / portfolio_df['cummax']) - 1
+            max_drawdown = portfolio_df['drawdown'].min()
+            
+            # Calculate CAGR and Sharpe ratio
+            daily_returns = portfolio_df['portfolio_value'].pct_change().dropna()
+            cagr = (final_value / initial_value) ** (252 / trading_days) - 1
+            volatility = daily_returns.std() * (252 ** 0.5)
+            sharpe_ratio = cagr / volatility if volatility > 0 else 0
+            
+            # Collect metrics
+            metrics = {
+                'Start Date': portfolio_df.iloc[0]['date'],
+                'End Date': portfolio_df.iloc[-1]['date'],
+                'Trading Days': trading_days,
+                'Initial Capital': initial_value,
+                'Final Portfolio Value': final_value,
+                'Total Return': total_return * 100,
+                'Annualized Return': annualized_return * 100,
+                'CAGR': cagr * 100,
+                'Volatility (Annual)': volatility * 100,
+                'Sharpe Ratio': sharpe_ratio,
+                'Max Drawdown': max_drawdown * 100,
+                'Total Trades': total_trades,
+                'Winning Trades': profitable_trades,
+                'Losing Trades': total_trades - profitable_trades,
+                'Win Rate': win_rate * 100,
+                'Average Profit': avg_profit,
+                'Average Loss': avg_loss,
+                'Profit Factor': profit_factor,
+                'Average Holding Period': trades_df['holding_days'].mean()
+            }
+            
+            # Calculate additional Indian market metrics
+            # Kurtosis - measures "tailedness" of returns distribution
+            metrics['Kurtosis'] = daily_returns.kurtosis()
+            
+            # Sortino ratio - variation of Sharpe that only considers downside volatility
+            downside_returns = daily_returns[daily_returns < 0]
+            downside_deviation = downside_returns.std() * (252 ** 0.5)
+            metrics['Sortino Ratio'] = cagr / downside_deviation if downside_deviation > 0 else 0
+            
+            # Maximum consecutive wins and losses
+            trades_df['win'] = trades_df['pnl'] > 0
+            win_streak = 0
+            max_win_streak = 0
+            loss_streak = 0
+            max_loss_streak = 0
+            
+            for win in trades_df['win']:
+                if win:
+                    win_streak += 1
+                    loss_streak = 0
+                    max_win_streak = max(max_win_streak, win_streak)
+                else:
+                    loss_streak += 1
+                    win_streak = 0
+                    max_loss_streak = max(max_loss_streak, loss_streak)
+            
+            metrics['Max Consecutive Wins'] = max_win_streak
+            metrics['Max Consecutive Losses'] = max_loss_streak
+            
+            # Analyze by trade direction
+            metrics['Long Trades'] = len(trades_df[trades_df['direction'] == 'long'])
+            metrics['Short Trades'] = len(trades_df[trades_df['direction'] == 'short'])
+            
+            if metrics['Long Trades'] > 0:
+                long_win_rate = sum(trades_df[trades_df['direction'] == 'long']['pnl'] > 0) / metrics['Long Trades']
+                metrics['Long Win Rate'] = long_win_rate * 100
+            else:
+                metrics['Long Win Rate'] = 0
+                
+            if metrics['Short Trades'] > 0:
+                short_win_rate = sum(trades_df[trades_df['direction'] == 'short']['pnl'] > 0) / metrics['Short Trades']
+                metrics['Short Win Rate'] = short_win_rate * 100
+            else:
+                metrics['Short Win Rate'] = 0
+            
+            # Create metrics DataFrame
+            metrics_df = pd.DataFrame([metrics])
             
             # Save results
-            results_csv_path = os.path.join(self.results_dir, 'backtest_results.csv')
-            results_df.to_csv(results_csv_path, index=False)
-            logger.info(f"Saved backtest results to {results_csv_path}")
+            base_path = f'{self.results_dir}/backtest_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}'
+            trades_df.to_csv(f'{base_path}_trades.csv', index=False)
+            portfolio_df.to_csv(f'{base_path}_portfolio.csv', index=False)
+            metrics_df.to_csv(f'{base_path}_metrics.csv', index=False)
             
-            # Generate summary plots
-            plt.figure(figsize=(15, 10))
+            # Generate performance charts
+            self.generate_backtest_charts(trades_df, portfolio_df, metrics, base_path)
             
-            # Success rate by prediction horizon
-            plt.subplot(2, 2, 1)
-            success_by_horizon = results_df.groupby('prediction_horizon')['target_reached'].mean()
-            success_by_horizon.plot(kind='bar')
-            plt.title('Success Rate by Prediction Horizon')
-            plt.ylabel('Success Rate')
+            logger.info(f"Backtest completed with {total_trades} trades")
+            logger.info(f"Win Rate: {win_rate:.2%}, Profit Factor: {profit_factor:.2f}, Total Return: {total_return:.2%}")
+            
+            return {
+                'trades': trades_df,
+                'portfolio': portfolio_df,
+                'metrics': metrics_df
+            }
+        else:
+            logger.warning("No trades executed during backtest period")
+            return None
+    
+    def generate_backtest_charts(self, trades_df, portfolio_df, metrics, base_path):
+        """
+        Generate comprehensive charts for backtest analysis
+        """
+        # Set style
+        plt.style.use('ggplot')
+        
+        # 1. Equity Curve
+        plt.figure(figsize=(14, 7))
+        plt.plot(portfolio_df['date'], portfolio_df['portfolio_value'])
+        plt.title('Portfolio Equity Curve')
+        plt.xlabel('Date')
+        plt.ylabel('Portfolio Value (₹)')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'{base_path}_equity_curve.png')
+        plt.close()
+        
+        # 2. Drawdown Chart
+        plt.figure(figsize=(14, 7))
+        plt.plot(portfolio_df['date'], portfolio_df['drawdown'] * 100)
+        plt.title('Portfolio Drawdown')
+        plt.xlabel('Date')
+        plt.ylabel('Drawdown (%)')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'{base_path}_drawdown.png')
+        plt.close()
+        
+        # 3. Trade PnL Distribution
+        plt.figure(figsize=(14, 7))
+        sns.histplot(trades_df['pnl'], kde=True)
+        plt.axvline(0, color='r', linestyle='--')
+        plt.title('Trade PnL Distribution')
+        plt.xlabel('PnL (₹)')
+        plt.ylabel('Frequency')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'{base_path}_pnl_distribution.png')
+        plt.close()
+        
+        # 4. Trade PnL by Direction
+        plt.figure(figsize=(14, 7))
+        sns.boxplot(x='direction', y='pnl', data=trades_df)
+        plt.title('Trade PnL by Direction')
+        plt.xlabel('Direction')
+        plt.ylabel('PnL (₹)')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'{base_path}_pnl_by_direction.png')
+        plt.close()
+        
+        # 5. Monthly Returns Heatmap
+        if len(portfolio_df) > 20:
+            # Calculate daily returns
+            portfolio_df['daily_return'] = portfolio_df['portfolio_value'].pct_change()
+            
+            # Resample to monthly returns
+            portfolio_df['month'] = portfolio_df['date'].dt.to_period('M')
+            portfolio_df['year'] = portfolio_df['date'].dt.year
+            
+            monthly_returns = portfolio_df.groupby(['year', 'month'])['daily_return'].apply(
+                lambda x: (1 + x).prod() - 1
+            ).reset_index()
+            
+            # Pivot for heatmap format
+            monthly_pivot = pd.pivot_table(
+                monthly_returns,
+                values='daily_return',
+                index='year',
+                columns=monthly_returns['month'].dt.month,
+                aggfunc='sum'
+            )
+            
+            # Create month labels
+            month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                            'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            monthly_pivot.columns = [month_labels[i-1] for i in monthly_pivot.columns]
+            
+            # Plot heatmap
+            plt.figure(figsize=(14, 7))
+            sns.heatmap(monthly_pivot * 100, annot=True, fmt=".2f", cmap="RdYlGn",
+                        linewidths=1, center=0, cbar_kws={'label': 'Monthly Return (%)'})
+            plt.title('Monthly Returns Heatmap (%)')
+            plt.tight_layout()
+            plt.savefig(f'{base_path}_monthly_returns.png')
+            plt.close()
+        
+        # 6. Performance metrics summary
+        plt.figure(figsize=(12, 10))
+        metrics_to_plot = [
+            'Total Return', 'Annualized Return', 'CAGR', 'Sharpe Ratio', 
+            'Sortino Ratio', 'Max Drawdown', 'Win Rate', 'Profit Factor'
+        ]
+        
+        # Extract values
+        values = [metrics[m] for m in metrics_to_plot]
+        
+        # Create horizontal bar chart
+        plt.barh(metrics_to_plot, values, color='steelblue')
+        plt.xlabel('Value')
+        plt.title('Performance Metrics Summary')
+        plt.grid(True, axis='x')
+        
+        # Add value labels
+        for i, v in enumerate(values):
+            if 'Ratio' in metrics_to_plot[i]:
+                plt.text(v + 0.1, i, f"{v:.2f}", va='center')
+            elif 'Factor' in metrics_to_plot[i]:
+                plt.text(v + 0.1, i, f"{v:.2f}x", va='center')
+            else:
+                plt.text(v + 0.1, i, f"{v:.2f}%", va='center')
+                
+        plt.tight_layout()
+        plt.savefig(f'{base_path}_metrics_summary.png')
+        plt.close()
+        
+        # 7. Confidence Score vs Return
+        plt.figure(figsize=(10, 6))
+        plt.scatter(trades_df['confidence'], trades_df['return_pct'], alpha=0.6)
+        plt.title('Confidence Score vs Trade Return')
+        plt.xlabel('Model Confidence Score')
+        plt.ylabel('Return (%)')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'{base_path}_confidence_vs_return.png')
+        plt.close()
+        
+        # 8. Rolling Win Rate
+        if len(trades_df) > 30:
+            plt.figure(figsize=(14, 7))
+            trades_df = trades_df.sort_values('entry_date')
+            trades_df['win'] = trades_df['pnl'] > 0
+            trades_df['rolling_win_rate'] = trades_df['win'].rolling(window=20).mean() * 100
+            
+            plt.plot(trades_df['entry_date'], trades_df['rolling_win_rate'])
+            plt.axhline(y=50, color='r', linestyle='--')
+            plt.title('20-Trade Rolling Win Rate')
+            plt.xlabel('Entry Date')
+            plt.ylabel('Win Rate (%)')
             plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f'{base_path}_rolling_win_rate.png')
+            plt.close()
             
-            # Average return by prediction horizon
-            plt.subplot(2, 2, 2)
-            return_by_horizon = results_df.groupby('prediction_horizon')['return_achieved'].mean()
-            return_by_horizon.plot(kind='bar')
-            plt.title('Average Return by Prediction Horizon')
-            plt.ylabel('Return')
-            plt.grid(True)
+        # 9. Compare Long vs Short Performance
+        if 'direction' in trades_df.columns and len(trades_df) > 10:
+            # Aggregate performance by direction
+            direction_perf = trades_df.groupby('direction').agg({
+                'pnl': ['sum', 'mean'],
+                'return_pct': 'mean',
+                'win': 'mean'
+            })
             
-            # Distribution of days to target
-            plt.subplot(2, 2, 3)
-            results_df[results_df['target_reached']]['days_to_target'].hist(bins=10)
-            plt.title('Distribution of Days to Target')
-            plt.xlabel('Days to Target')
-            plt.ylabel('Frequency')
-            plt.grid(True)
+            direction_perf.columns = ['Total_PnL', 'Avg_PnL', 'Avg_Return_Pct', 'Win_Rate']
+            direction_perf['Win_Rate'] *= 100  # Convert to percentage
             
-            # Confidence score vs. success rate
-            plt.subplot(2, 2, 4)
-            results_df['confidence_bin'] = pd.cut(results_df['confidence_score'], bins=10)
-            conf_vs_success = results_df.groupby('confidence_bin')['target_reached'].mean()
-            conf_vs_success.index = conf_vs_success.index.map(lambda x: f"{x.left:.2f}-{x.right:.2f}")
-            conf_vs_success.plot(kind='bar')
-            plt.title('Confidence Score vs. Success Rate')
-            plt.xlabel('Confidence Score Range')
-            plt.ylabel('Success Rate')
-            plt.xticks(rotation=45)
-            plt.grid(True)
+            # Plot comparison
+            fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+            
+            # Total PnL
+            axs[0, 0].bar(direction_perf.index, direction_perf['Total_PnL'])
+            axs[0, 0].set_title('Total PnL by Direction')
+            axs[0, 0].set_ylabel('Total PnL (₹)')
+            axs[0, 0].grid(True)
+            
+            # Avg PnL
+            axs[0, 1].bar(direction_perf.index, direction_perf['Avg_PnL'])
+            axs[0, 1].set_title('Average PnL per Trade')
+            axs[0, 1].set_ylabel('Avg PnL (₹)')
+            axs[0, 1].grid(True)
+            
+            # Avg Return %
+            axs[1, 0].bar(direction_perf.index, direction_perf['Avg_Return_Pct'])
+            axs[1, 0].set_title('Average Return % per Trade')
+            axs[1, 0].set_ylabel('Avg Return (%)')
+            axs[1, 0].grid(True)
+            
+            # Win Rate
+            axs[1, 1].bar(direction_perf.index, direction_perf['Win_Rate'])
+            axs[1, 1].set_title('Win Rate by Direction')
+            axs[1, 1].set_ylabel('Win Rate (%)')
+            axs[1, 1].grid(True)
             
             plt.tight_layout()
-            # Similarly for the plot files
-            summary_plot_path = os.path.join(self.results_dir, 'backtest_summary.png')
-            plt.savefig(summary_plot_path)
+            plt.savefig(f'{base_path}_direction_comparison.png')
             plt.close()
-            logger.info(f"Saved backtest summary plot to {summary_plot_path}")
-            
-            # Additional model comparison chart
-            if 'model_type' in results_df.columns:
-                plt.figure(figsize=(12, 6))
-                
-                # Success rate by model type and horizon
-                model_horizon_success = results_df.groupby(['model_type', 'prediction_horizon'])['target_reached'].mean().unstack()
-                model_horizon_success.plot(kind='bar')
-                plt.title('Success Rate by Model Type and Prediction Horizon')
-                plt.ylabel('Success Rate')
-                plt.xlabel('Model Type')
-                plt.grid(True)
-                plt.tight_layout()
-                plt.savefig(f'{self.results_dir}/backtest_model_comparison.png')
-                plt.close()
-            
-            # Add this near the end of the backtest method before the return statement
-            if backtest_results:
-                logger.info(f"Backtest successfully completed with {len(backtest_results)} predictions")
-                logger.info(f"Saving results to {self.results_dir}/backtest_results.csv")
-            else:
-                logger.warning("Backtest completed but found no predictions matching criteria")
-            
-            return results_df
-        else:
-            logger.warning("No backtest results generated")
-            logger.debug(f"Rejected {symbol} for {days}d horizon (confidence: {ensemble_proba:.4f})")
-            return None
+        
+        # 10. Holding Period Analysis
+        plt.figure(figsize=(12, 6))
+        sns.histplot(trades_df['holding_days'], kde=True, bins=15)
+        plt.axvline(trades_df['holding_days'].mean(), color='r', linestyle='--', 
+                    label=f'Mean: {trades_df["holding_days"].mean():.1f} days')
+        plt.title('Distribution of Holding Periods')
+        plt.xlabel('Holding Period (days)')
+        plt.ylabel('Frequency')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'{base_path}_holding_period.png')
+        plt.close()
     
     def align_features(self, X, features, expected_features):
         """
@@ -2304,9 +2967,9 @@ class StockPredictionFramework:
 
     def predict_stocks_with_potential(self, confidence_threshold=0.7):
         """
-        Identify stocks with potential for upside movement based on current data
+        Identify stocks with potential for upside and downside movement
         """
-        logger.info(f"Identifying stocks with upside potential (threshold: {confidence_threshold})")
+        logger.info(f"Identifying stocks with potential (threshold: {confidence_threshold})")
 
         # Ensure scalers are loaded
         if sum(1 for _ in self.scalers.values()) < len(self.prediction_horizon_days):
@@ -2341,7 +3004,13 @@ class StockPredictionFramework:
         
         # Process each prediction horizon separately
         for days in self.prediction_horizon_days:
-            logger.info(f"Processing {days}-day horizon predictions")
+            for direction in ['long', 'short']:
+                logger.info(f"Processing {direction} {days}-day horizon predictions")
+                
+                # Use direction-specific feature sets and models
+                feature_key = f'{direction}_{days}d'
+                lgbm_model_key = f'lgbm_{direction}_{days}d'
+                pytorch_model_key = f'pytorch_{direction}_{days}d'
             
             # First, load the expected features for this horizon
             feature_path = f'{self.results_dir}/selected_features_{days}d.csv'
@@ -2458,6 +3127,7 @@ class StockPredictionFramework:
                             'trading_symbol': symbol,
                             'company_name': row['company_name'],
                             'prediction_date': latest_date,
+                            'direction': direction,
                             'prediction_horizon': days,
                             'confidence_score': ensemble_proba,
                             'current_price': current_price,
@@ -2502,7 +3172,7 @@ class StockPredictionFramework:
         """
         logger.info("Starting complete pipeline")
         
-        # Train all models
+        # Train all models (both long and short)
         self.train_all_models()
         
         # Create feature importance report
@@ -2511,14 +3181,15 @@ class StockPredictionFramework:
         # Evaluate models
         evaluation_results = self.evaluate_models()
         
-        # Backtest
+        # Backtest with GPU acceleration
         backtest_results = self.backtest(
             start_date='2024-10-01',
             end_date='2024-12-31',
-            confidence_threshold=0.7  # Try an extremely low threshold
+            confidence_threshold=0.7,
+            batch_size=64  # GPU batch size
         )
         
-        # Generate predictions
+        # Generate predictions (both long and short)
         predictions = self.predict_stocks_with_potential(confidence_threshold=0.7)
         
         logger.info("Pipeline completed successfully")
@@ -2535,13 +3206,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Stock Prediction Framework')
     parser.add_argument('--db_password', required=True, help='Database password')
     parser.add_argument('--mode', choices=['train', 'evaluate', 'backtest', 'predict', 'full'],
-                       default='full', help='Mode to run')
+                      default='full', help='Mode to run')
     parser.add_argument('--confidence', type=float, default=0.7, 
-                       help='Confidence threshold for predictions')
+                      help='Confidence threshold for predictions')
     parser.add_argument('--batch_size', type=int, default=512,
-                       help='Batch size for training')
+                      help='Batch size for training')
     parser.add_argument('--use_pytorch', action='store_true', default=True,
-                       help='Use PyTorch for neural network models')
+                      help='Use PyTorch for neural network models')
+    parser.add_argument('--upside_threshold_min', type=float, default=0.025,
+                      help='Minimum upside target threshold for long positions')
+    parser.add_argument('--upside_threshold_max', type=float, default=0.05,
+                      help='Maximum upside target threshold for long positions')
+    parser.add_argument('--downside_threshold_min', type=float, default=0.025,
+                      help='Minimum downside target threshold for short positions')
+    parser.add_argument('--downside_threshold_max', type=float, default=0.05,
+                      help='Maximum downside target threshold for short positions')
+    parser.add_argument('--backtest_start_date', type=str, default=None,
+                      help='Start date for backtesting (YYYY-MM-DD)')
+    parser.add_argument('--backtest_end_date', type=str, default=None,
+                      help='End date for backtesting (YYYY-MM-DD)')
     
     args = parser.parse_args()
     
@@ -2549,9 +3232,11 @@ if __name__ == "__main__":
     framework = StockPredictionFramework(
         db_password=args.db_password,
         prediction_horizon_days=[1, 3, 5, 7, 10],
-        upside_threshold_min=0.025,
-        upside_threshold_max=0.05,
-        use_pytorch=args.use_pytorch  # Add this parameter
+        upside_threshold_min=args.upside_threshold_min,
+        upside_threshold_max=args.upside_threshold_max,
+        downside_threshold_min=args.downside_threshold_min,
+        downside_threshold_max=args.downside_threshold_max,
+        use_pytorch=args.use_pytorch
     )
     
     # Run based on mode
@@ -2560,7 +3245,11 @@ if __name__ == "__main__":
     elif args.mode == 'evaluate':
         framework.evaluate_models()
     elif args.mode == 'backtest':
-        framework.backtest(confidence_threshold=args.confidence)
+        framework.backtest(
+            start_date=args.backtest_start_date,
+            end_date=args.backtest_end_date,
+            confidence_threshold=args.confidence
+        )
     elif args.mode == 'predict':
         framework.predict_stocks_with_potential(confidence_threshold=args.confidence)
     elif args.mode == 'full':

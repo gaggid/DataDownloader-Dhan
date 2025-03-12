@@ -1,7 +1,10 @@
 feature,importance
-parkinson_vol_10d,148
-dist_from_vwap_support_2,15
-earnings_q1,12
-dist_from_vwap_support_1,11
-earnings_q2,11
-vwap_support_1,10
+index_return_30d,470
+index_return_15d,393
+index_return_20d,357
+earnings_q1,65
+parkinson_vol_20d,59
+earnings_q2,45
+price_range_pct,33
+parkinson_vol_5d,26
+parkinson_vol_10d,12

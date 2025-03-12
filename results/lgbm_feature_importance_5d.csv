@@ -1,6 +1,11 @@
 feature,importance
-parkinson_vol_5d,78
-parkinson_vol_20d,67
-parkinson_vol_10d,58
-price_range_pct,41
-earnings_q1,11
+index_return_30d,199
+index_return_15d,179
+index_return_20d,163
+earnings_q1,32
+parkinson_vol_20d,29
+parkinson_vol_5d,27
+price_range_pct,26
+body_size_pct,8
+vol_regime_10d,6
+parkinson_vol_10d,3
